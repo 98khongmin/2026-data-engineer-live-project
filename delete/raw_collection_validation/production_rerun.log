@@ -1,0 +1,48 @@
+Submitting amazon_reviews_etl.py in amazon-review-pipeline-spark-master-1
+Submitting /opt/spark/app/amazon_reviews_etl.py (name: amazon_reviews_etl)
+26/10/26 02:47:52 INFO SparkContext: Running Spark version 3.5.9
+26/10/26 02:47:52 INFO SparkContext: OS info Linux, 7.0.14-linuxkit, aarch64
+26/10/26 02:47:52 INFO SparkContext: Java version 17.0.20.1
+26/10/26 02:47:52 WARN NativeCodeLoader: Unable to load native-hadoop library for your platform... using builtin-java classes where applicable
+26/10/26 02:47:52 INFO ResourceUtils: ==============================================================
+26/10/26 02:47:52 INFO ResourceUtils: No custom resources configured for spark.driver.
+26/10/26 02:47:52 INFO ResourceUtils: ==============================================================
+26/10/26 02:47:52 INFO SparkContext: Submitted application: amazon-reviews-raw-collection
+26/10/26 02:47:52 INFO ResourceProfile: Default ResourceProfile created, executor resources: Map(cores -> name: cores, amount: 2, script: , vendor: , memory -> name: memory, amount: 1024, script: , vendor: , offHeap -> name: offHeap, amount: 0, script: , vendor: ), task resources: Map(cpus -> name: cpus, amount: 1.0)
+26/10/26 02:47:52 INFO ResourceProfile: Limiting resource is cpus at 2 tasks per executor
+26/10/26 02:47:52 INFO ResourceProfileManager: Added ResourceProfile id: 0
+26/10/26 02:47:52 INFO SecurityManager: Changing view acls to: spark
+26/10/26 02:47:52 INFO SecurityManager: Changing modify acls to: spark
+26/10/26 02:47:52 INFO SecurityManager: Changing view acls groups to: 
+26/10/26 02:47:52 INFO SecurityManager: Changing modify acls groups to: 
+26/10/26 02:47:52 INFO SecurityManager: SecurityManager: authentication disabled; ui acls disabled; users with view permissions: spark; groups with view permissions: EMPTY; users with modify permissions: spark; groups with modify permissions: EMPTY
+26/10/26 02:47:52 INFO Utils: Successfully started service 'sparkDriver' on port 39000.
+26/10/26 02:47:52 INFO SparkEnv: Registering MapOutputTracker
+26/10/26 02:47:52 INFO SparkEnv: Registering BlockManagerMaster
+26/10/26 02:47:52 INFO BlockManagerMasterEndpoint: Using org.apache.spark.storage.DefaultTopologyMapper for getting topology information
+26/10/26 02:47:52 INFO BlockManagerMasterEndpoint: BlockManagerMasterEndpoint up
+26/10/26 02:47:52 INFO SparkEnv: Registering BlockManagerMasterHeartbeat
+26/10/26 02:47:52 INFO DiskBlockManager: Created local directory at /tmp/spark-local/blockmgr-3cb8e9f6-9611-4d24-8f35-84ad6547bbcd
+26/10/26 02:47:52 INFO MemoryStore: MemoryStore started with capacity 1048.8 MiB
+26/10/26 02:47:52 INFO SparkEnv: Registering OutputCommitCoordinator
+26/10/26 02:47:52 INFO JettyUtils: Start Jetty 0.0.0.0:4040 for SparkUI
+26/10/26 02:47:52 INFO Utils: Successfully started service 'SparkUI' on port 4040.
+26/10/26 02:47:52 INFO StandaloneAppClient$ClientEndpoint: Connecting to master spark://spark-master:7077...
+26/10/26 02:47:52 INFO TransportClientFactory: Successfully created connection to spark-master/172.20.0.3:7077 after 13 ms (0 ms spent in bootstraps)
+26/10/26 02:47:52 INFO StandaloneSchedulerBackend: Connected to Spark cluster with app ID app-20261026024752-0004
+26/10/26 02:47:52 INFO StandaloneAppClient$ClientEndpoint: Executor added: app-20261026024752-0004/0 on worker-20261026024154-spark-worker-1-34921 (spark-worker-1:34921) with 2 core(s)
+26/10/26 02:47:52 INFO StandaloneSchedulerBackend: Granted executor ID app-20261026024752-0004/0 on hostPort spark-worker-1:34921 with 2 core(s), 1024.0 MiB RAM
+26/10/26 02:47:52 INFO StandaloneAppClient$ClientEndpoint: Executor added: app-20261026024752-0004/1 on worker-20261026024154-spark-worker-2-45331 (spark-worker-2:45331) with 2 core(s)
+26/10/26 02:47:52 INFO StandaloneSchedulerBackend: Granted executor ID app-20261026024752-0004/1 on hostPort spark-worker-2:45331 with 2 core(s), 1024.0 MiB RAM
+26/10/26 02:47:52 INFO Utils: Successfully started service 'org.apache.spark.network.netty.NettyBlockTransferService' on port 39001.
+26/10/26 02:47:52 INFO NettyBlockTransferService: Server created on spark-master 0.0.0.0:39001
+26/10/26 02:47:52 INFO BlockManager: Using org.apache.spark.storage.RandomBlockReplicationPolicy for block replication policy
+26/10/26 02:47:52 INFO BlockManagerMaster: Registering BlockManager BlockManagerId(driver, spark-master, 39001, None)
+26/10/26 02:47:52 INFO BlockManagerMasterEndpoint: Registering block manager spark-master:39001 with 1048.8 MiB RAM, BlockManagerId(driver, spark-master, 39001, None)
+26/10/26 02:47:52 INFO BlockManagerMaster: Registered BlockManager BlockManagerId(driver, spark-master, 39001, None)
+26/10/26 02:47:52 INFO BlockManager: Initialized BlockManager: BlockManagerId(driver, spark-master, 39001, None)
+26/10/26 02:47:52 INFO StandaloneAppClient$ClientEndpoint: Executor updated: app-20261026024752-0004/1 is now RUNNING
+26/10/26 02:47:52 INFO StandaloneAppClient$ClientEndpoint: Executor updated: app-20261026024752-0004/0 is now RUNNING
+26/10/26 02:47:52 INFO StandaloneSchedulerBackend: SchedulerBackend is ready for scheduling beginning after reached minRegisteredResourcesRatio: 0.0
+Source: All_Beauty.jsonl; resume line: 701529; state: /opt/spark/states/All_Beauty.json
+Collection completed: 701,528 lines; state saved.

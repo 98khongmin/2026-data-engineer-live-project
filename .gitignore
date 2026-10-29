@@ -1,1 +1,7 @@
 *.jsonl
+
+# Spark output & partition files
+part*
+.part*
+*.crc
+_SUCCESS

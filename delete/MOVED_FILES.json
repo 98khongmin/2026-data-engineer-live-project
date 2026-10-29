@@ -1,0 +1,77 @@
+[
+  {
+    "path": ".DS_Store",
+    "size": 10244,
+    "inode": 299573039
+  },
+  {
+    "path": ".env.example",
+    "size": 456,
+    "inode": 299601280
+  },
+  {
+    "path": ".ipynb_checkpoints/Untitled-checkpoint.ipynb",
+    "size": 23934,
+    "inode": 299574727
+  },
+  {
+    "path": "Untitled.ipynb",
+    "size": 28161,
+    "inode": 299574725
+  },
+  {
+    "path": "checkpoint.json",
+    "size": 21,
+    "inode": 299577616
+  },
+  {
+    "path": "data/.DS_Store",
+    "size": 6148,
+    "inode": 299585776
+  },
+  {
+    "path": "data/Beauty_and_Personal_Care.jsonl",
+    "size": 11021458876,
+    "inode": 299572994
+  },
+  {
+    "path": "data/Video_Games.jsonl",
+    "size": 2682948518,
+    "inode": 299572995
+  },
+  {
+    "path": "data/brightdata/sd_mviwptih2dqyh0k9du.jsonl",
+    "size": 3996,
+    "inode": 299572997
+  },
+  {
+    "path": "data/meta_All_Beauty.jsonl",
+    "size": 212990142,
+    "inode": 299572999
+  },
+  {
+    "path": "data/meta_Beauty_and_Personal_Care.jsonl",
+    "size": 2835194976,
+    "inode": 299573000
+  },
+  {
+    "path": "data/meta_Video_Games.jsonl",
+    "size": 437375785,
+    "inode": 299572998
+  },
+  {
+    "path": "data/raw/reviews.jsonl",
+    "size": 323268841,
+    "inode": 299577615
+  },
+  {
+    "path": "jobs/__pycache__/amazon_reviews_etl.cpython-311.pyc",
+    "size": 13488,
+    "inode": 299592251
+  },
+  {
+    "path": "postgres/.DS_Store",
+    "size": 6148,
+    "inode": 299605091
+  }
+]

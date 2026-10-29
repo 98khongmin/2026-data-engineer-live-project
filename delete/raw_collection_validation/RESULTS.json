@@ -1,0 +1,12 @@
+{
+  "input_lines": 701528,
+  "stored_rows": 694252,
+  "key_conflicts_skipped": 7276,
+  "pk": "PRIMARY KEY (user_id, parent_asin, \"timestamp\")",
+  "payload_sample_lines_checked": [
+    1,
+    350000,
+    701528
+  ],
+  "completed": true
+}

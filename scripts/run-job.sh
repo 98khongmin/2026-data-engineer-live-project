@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-JOB_SCRIPT="${1:-amazon_reviews_etl.py}"
+JOB_SCRIPT="${1:-collector.py}"
 JOB_SCRIPT="${JOB_SCRIPT#jobs/}"
 if [[ $# -gt 0 ]]; then shift; fi
 
-# 수집은 일반 Python, 정제만 Spark 클러스터로 제출합니다.
-if [[ "$JOB_SCRIPT" == "refine_reviews.py" ]]; then
+# 수집은 일반 Python, Spark 작업은 클러스터로 제출합니다.
+if [[ "$JOB_SCRIPT" == "refine_reviews.py" || "$JOB_SCRIPT" == *"spark"* ]]; then
   exec /opt/spark/bin/spark-submit \
     --master "${SPARK_MASTER_URL:-spark://spark-master:7077}" \
     --deploy-mode client \

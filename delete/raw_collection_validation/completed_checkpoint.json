@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "source": {
+    "name": "_raw_collection_check.jsonl",
+    "size_bytes": 381,
+    "mtime_ns": 1792982594379575039,
+    "sha256": "bb4d109e2839e3441f769a14502f1c37bebd1a0d652fbca5369cfe686a9c5cb8"
+  },
+  "target": {
+    "host": "postgres",
+    "port": 5432,
+    "database": "reviews",
+    "table": "raw_reviews_collection_check"
+  },
+  "next_byte": 381,
+  "lines_committed": 4,
+  "inserted_rows": 3,
+  "skipped_rows": 1,
+  "completed": true,
+  "last_key": [
+    "check_u3",
+    "check_p3",
+    1700000000003
+  ]
+}

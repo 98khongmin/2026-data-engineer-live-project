@@ -1,0 +1,155 @@
+name: amazon-review-pipeline
+
+x-spark: &spark
+  image: amazon-review-spark:3.5.9
+  build:
+    context: .
+  init: true
+  environment: &spark-env
+    SPARK_HOME: /opt/spark
+    PYSPARK_PYTHON: python3
+    PYSPARK_DRIVER_PYTHON: python3
+    SPARK_LOCAL_DIRS: /tmp/spark-local
+  volumes:
+    - ./jobs:/opt/spark/app:ro
+    - ./scripts:/opt/spark/scripts:ro
+    - ./data:/opt/spark/data:ro
+    - ./config/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+  networks:
+    - pipeline-net
+
+services:
+  spark-master:
+    <<: *spark
+    hostname: spark-master
+    restart: unless-stopped
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.master.Master
+      - --host
+      - spark-master
+      - --port
+      - '7077'
+      - --webui-port
+      - '8080'
+    ports:
+      - '127.0.0.1:${SPARK_MASTER_UI_PORT:-8080}:8080'
+      - '127.0.0.1:${SPARK_MASTER_PORT:-7077}:7077'
+    healthcheck:
+      test: [ 'CMD', 'python3', '-c', 'import urllib.request; urllib.request.urlopen("http://localhost:8080/json/", timeout=3).read()' ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  spark-worker-1:
+    <<: *spark
+    hostname: spark-worker-1
+    restart: unless-stopped
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.worker.Worker
+      - --host
+      - spark-worker-1
+      - --webui-port
+      - '8081'
+      - --cores
+      - '${SPARK_WORKER_CORES:-2}'
+      - --memory
+      - '${SPARK_WORKER_MEMORY:-1536M}'
+      - spark://spark-master:7077
+    ports:
+      - '127.0.0.1:${SPARK_WORKER_1_UI_PORT:-8081}:8081'
+    healthcheck:
+      test: [ 'CMD', 'python3', '-c', 'import urllib.request; urllib.request.urlopen("http://localhost:8081/json/", timeout=3).read()' ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  spark-worker-2:
+    <<: *spark
+    hostname: spark-worker-2
+    restart: unless-stopped
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.worker.Worker
+      - --host
+      - spark-worker-2
+      - --webui-port
+      - '8081'
+      - --cores
+      - '${SPARK_WORKER_CORES:-2}'
+      - --memory
+      - '${SPARK_WORKER_MEMORY:-1536M}'
+      - spark://spark-master:7077
+    ports:
+      - '127.0.0.1:${SPARK_WORKER_2_UI_PORT:-8082}:8081'
+    healthcheck:
+      test: [ 'CMD', 'python3', '-c', 'import urllib.request; urllib.request.urlopen("http://localhost:8081/json/", timeout=3).read()' ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  postgres:
+    image: postgres:16-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-reviews}
+      POSTGRES_USER: ${POSTGRES_USER:-reviews}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    ports:
+      - '127.0.0.1:${POSTGRES_PORT:-5432}:5432'
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: [ 'CMD-SHELL', 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"' ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    networks:
+      - pipeline-net
+
+  spark-job:
+    <<: *spark
+    profiles: [ 'jobs' ]
+    hostname: spark-job
+    restart: 'no'
+    environment:
+      <<: *spark-env
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: '5432'
+      POSTGRES_DB: ${POSTGRES_DB:-reviews}
+      POSTGRES_USER: ${POSTGRES_USER:-reviews}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      INPUT_PATH: ${INPUT_PATH:-/opt/spark/data/All_Beauty.jsonl}
+      HASH_COLUMNS: ${HASH_COLUMNS:-user_id,product_id,review_text}
+      JDBC_PARTITIONS: ${JDBC_PARTITIONS:-2}
+      JDBC_BATCH_SIZE: ${JDBC_BATCH_SIZE:-1000}
+    depends_on:
+      spark-master:
+        condition: service_healthy
+      spark-worker-1:
+        condition: service_healthy
+      spark-worker-2:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    command:
+      - /bin/bash
+      - /opt/spark/scripts/run-job.sh
+      - amazon_reviews_etl.py
+
+networks:
+  pipeline-net:
+volumes:
+  postgres-data:

@@ -13,7 +13,7 @@ x-spark: &spark
   volumes:
     - ./jobs:/opt/spark/app:ro
     - ./scripts:/opt/spark/scripts:ro
-    - ./data:/opt/spark/data:ro
+    - ./data:/opt/spark/data:rw
     - ./states:/opt/spark/states:rw
     - ./config/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
   networks:
@@ -147,7 +147,7 @@ services:
     command:
       - /bin/bash
       - /opt/spark/scripts/run-job.sh
-      - amazon_reviews_etl.py
+      - collector.py
 
 networks:
   pipeline-net:

@@ -28,53 +28,44 @@
 
 ## 현재 구조와 도구 선정 이유
 
-현재는 Kafka 없이 **JSONL → Python 수집 → PostgreSQL 원본 저장 → Spark 분산 정제 → PostgreSQL 정제 저장**으로 동작합니다.
-실시간 입력을 재생하는 방식이 아니라, 파일을 읽는 배치 처리입니다.
-수집 처리량은 파일·DB 입출력 성능에 따라 달라지며 초당 N건으로 제한하는 기능은 없습니다.
+데이터 레이크의 표준인 **메달리온 아키텍처(Medallion Architecture: Bronze → Silver → Gold)** 구조를 따릅니다.
+**수집기(JSONL) → Raw 파일 적재(`data/raw/`) → Spark 분산 정제/중복제거 → Processed Parquet(`data/processed/`) + PostgreSQL 일별 집계(`daily_review_summary`)**로 동작합니다.
 
-| 도구 | 역할과 선정 이유 | 구현 상태 |
-| --- | --- | --- |
-| Python | JSONL을 1,000건씩 원본 테이블에 저장하고 states로 재시작 위치 관리 | 구현 완료 |
-| Spark | 마스터 1개·워커 2개에서 기본 4개 파티션으로 병렬 정제. 향후 데이터 규모 확장에 대비 | 구현 완료 |
-| PostgreSQL | 원본과 정제 결과를 별도 테이블에 저장. 기본 키와 충돌 시 건너뛰기로 재실행 중복 방지 | 구현 완료 |
-| Docker Compose | PostgreSQL과 Spark 실행 환경을 구성하고 상태 파일·DB 데이터 유지 | 구현 완료 |
-| Airflow | 수집 → 정제 → 집계·분석의 의존성, 재시도, 실행 이력과 월간 배치 일정 관리 | 향후 계획 |
-| 감정 분석 모델 | 리뷰 감정 점수와 불만 키워드 분석. RTX 3080 Ti 환경의 별도 프로세스 실행 검토 | 향후 계획 |
-| Grafana | 처리량·처리 시간·실패·자원 사용량 모니터링. 지표 수집 구성도 함께 필요 | 향후 계획 |
+| 계층 | 역할과 기술 스택 | 저장 포맷 및 위치 | 기본키(PK) / 식별자 |
+| :--- | :--- | :--- | :--- |
+| **1단계: Raw (Bronze)** | 수집기(`collector.py`)가 원본 JSONL을 Landing Zone에 보관 | JSONL (`data/raw/`) | 없음 (원시 로그 파일) |
+| **2단계: Processed (Silver)** | Spark가 읽어 결측치 정제 및 `review_id` 기준 분산 중복 제거 | Parquet (`data/processed/reviews/`)<br/>`partitionBy("review_date")` | `review_id` (UUID5: user_id + parent_asin + timestamp) |
+| **3단계: Aggregation (Gold)** | Spark가 일자별 리뷰 수, 평균 평점, 구매인증 수를 요약 집계하여 DB 적재 | PostgreSQL (`public.daily_review_summary`) | `review_date` (DATE PRIMARY KEY) |
 
-Kafka는 현재의 정적 파일 배치 수집에는 도입하지 않았습니다.
-수집과 정제를 별도 작업 및 DB 테이블로 나누고, 수집의 진행 상태와 DB 기본 키로 재실행에 대응합니다.
-향후 지속적인 실시간 입력과 메시지 버퍼링이 필요해지면 도입을 검토합니다.
+### 저장 포맷을 고른 이유
 
-PostgreSQL은 현재 `ON CONFLICT DO NOTHING`으로 기존 행을 유지합니다.
-동일 키의 기존 값을 갱신하는 방식의 upsert는 구현하지 않았습니다.
+1. **정제 원본 ➔ Parquet (컬럼 지향 포맷)**:
+   - 70만 건 이상의 대용량 상세 데이터를 행 단위 RDBMS에 전부 저장하면 DB CPU/I/O 병목 및 스토리지 낭비가 발생합니다.
+   - Parquet은 컬럼별 Snappy 압축률이 우수하며, `partitionBy("review_date")`로 날짜별 파티션 프루닝(Partition Pruning)과 필요한 컬럼만 읽는 컬럼 프루닝(Column Pruning)을 통해 대규모 분석 쿼리 속도를 극대화합니다.
+2. **집계 통계 ➔ PostgreSQL (관계형 데이터베이스)**:
+   - 일자별로 요약 집계된 데이터(약 6,500행)는 데이터 크기가 작고, Grafana 대시보드나 백엔드 서비스에서 빈번하고 빠른 포인트 조회가 일어납니다.
+   - 인덱스와 트랜잭션(ACID)을 지원하는 RDBMS가 서빙 및 시각화 도구 연동에 가장 적합합니다.
 
-### 실행 결과
+### 실행 명령
 
-빈 테이블에서 수집·정제를 수행한 결과입니다. 재실행 시 신규 저장 건수는 달라질 수 있습니다.
+1. **수집기 실행 (원본 파일을 data/raw/ 에 적재)**:
+   ```bash
+   ./submit-job.sh collector.py
+   ```
+2. **Spark 정제 및 적재 실행**:
+   ```bash
+   ./submit-job.sh refine_reviews.py
+   ```
 
-| 단계 | 건수 |
-| --- | ---: |
-| JSONL 입력 | 701,528 |
-| 수집 중 동일 원본 키로 건너뛴 행 | 7,276 |
-| 원본 테이블 저장 | 694,252 |
-| 정제 조건 미충족으로 제외 | 705 |
-| 정제 테이블 저장 | 693,547 |
+### 실행 및 멱등성(동일 파일 중복 투입) 검증 결과
 
-수집 중 중복은 `(user_id, parent_asin, timestamp)`가 같은 행을 뜻하며,
-리뷰 본문까지 모두 동일하다는 의미는 아닙니다.
+`data/raw/` 폴더에 원본 파일 1개(`All_Beauty.jsonl`, 701,528건)를 넣고 실행했을 때와, **동일한 파일을 2개(`All_Beauty.jsonl` + `All_Beauty_duplicate.jsonl`, 1,403,056건) 넣고 실행했을 때의 결과 비교**입니다:
 
-## JSONL 원본 수집 — 필드별 컬럼 저장
+| 검증 단계 | 1차 실행 (정상 파일 1개) | 2차 실행 (동일 파일 2개 투입) | 검증 결과 |
+| :--- | :---: | :---: | :---: |
+| Spark 원본 로딩 건수 (`data/raw/`) | 701,528건 | 1,403,056건 | 2배 입력 로드 확인 |
+| `review_id` 기준 중복 제거 및 제외 | 7,981건 | 709,509건 | 복사본 701,528건 자동 제거 |
+| **정제 완료 Parquet 건수 (`data/processed/`)** | **693,547건** | **693,547건** | **완벽 일치 (건수 불변)** |
+| **PostgreSQL 일별 집계 (`daily_review_summary`)** | **6,557일** (총 693,547건) | **6,557일** (총 693,547건) | **완벽 일치 (건수 불변)** |
 
-실행 명령:
-
-```bash
-./submit-job.sh jobs/amazon_reviews_etl.py
-```
-
-일반 Python으로 JSONL을 읽어 1,000건씩 `raw_reviews`에 저장합니다.
-Spark 정제, NULL 제거, 본문 공백 제거, timestamp 단위 변환은 하지 않습니다.
-
-## 수집 및 정제
-
-`submit-job.sh`로 수집 코드를 실행한 뒤 정제 코드를 실행합니다. 수집은 일반 Python으로 JSONL의 필드 값을 PostgreSQL `raw_reviews`에 1,000건씩 저장하며, 기본 키 `(user_id, parent_asin, timestamp)`가 같으면 건너뜁니다. DB 커밋 후 `states`에 마지막 처리 줄을 기록해 중단 후 이어서 실행할 수 있습니다. 정제는 Spark 워커 2개와 기본 4개 파티션으로 수행하며, 유효하지 않은 리뷰 제외, 본문·제목 공백 정리, 날짜 변환, UUID5 ID 생성을 거쳐 `amazon_reviews`에 저장합니다. 기존 ID는 건너뛰고, 원본 JSONL과 원본 테이블은 유지합니다. 기존 DB는 마이그레이션 SQL로 변경하고, 새 DB는 초기화 SQL로 생성하며, 코드 변경은 마운트를 통해 반영됩니다.
+Spark의 `dropDuplicates(["review_id"])`와 파티션 Overwrite 모드를 통해 동일 파일이 중복 수집되거나 재실행되어도 **결과 건수가 100% 동일하게 유지되는 멱등성(Idempotency)**을 검증 완료했습니다.

@@ -2,18 +2,10 @@
 import argparse
 import json
 import os
-import sys
 from pathlib import Path
 
 import psycopg2
-from psycopg2.extras import Json, execute_values
-from tqdm import tqdm
-
-
-REVIEW_COLUMNS = {
-    "user_id", "parent_asin", "timestamp", "rating", "title", "text",
-    "images", "asin", "helpful_vote", "verified_purchase",
-}
+from psycopg2.extras import execute_values
 
 
 def load_state(state_file, input_file):
@@ -47,8 +39,7 @@ def save_batch(connection, batch, state_file, input_file):
     """DB 저장에 성공한 다음에만 진행 상태를 갱신합니다."""
     sql = '''
         INSERT INTO raw_reviews
-            (user_id, parent_asin, "timestamp", rating, title, text,
-             images, asin, helpful_vote, verified_purchase, source_file, source_line)
+            (user_id, parent_asin, "timestamp", raw_payload, source_file, source_line)
         VALUES %s
         ON CONFLICT (user_id, parent_asin, "timestamp") DO NOTHING
     '''
@@ -59,7 +50,7 @@ def save_batch(connection, batch, state_file, input_file):
 
     last_line = batch[-1][-1]
     save_state(state_file, input_file, last_line)
-    return inserted
+    print(f"{last_line:,}행까지 완료: 저장 {inserted}건, 중복 스킵 {len(batch) - inserted}건", flush=True)
 
 
 def main():
@@ -78,6 +69,7 @@ def main():
     states_dir.mkdir(parents=True, exist_ok=True)
     state_file = states_dir / f"{input_file.stem}.json"
     last_line = 0 if args.reset_state else load_state(state_file, input_file)
+    print(f"수집 시작: {input_file.name}, {last_line + 1:,}행부터", flush=True)
 
     connection = psycopg2.connect(
         host=os.getenv("POSTGRES_HOST", "postgres"),
@@ -87,33 +79,15 @@ def main():
         password=os.environ["POSTGRES_PASSWORD"],
     )
     try:
-        # DB를 초기화해도 states 파일은 남을 수 있습니다.
-        with connection.cursor() as cursor:
-            cursor.execute("SELECT EXISTS (SELECT 1 FROM raw_reviews)")
-            has_data = cursor.fetchone()[0]
-        if last_line > 0 and not has_data:
-            print("DB가 비어 있어 체크포인트 대신 처음부터 수집합니다.", flush=True)
-            last_line = 0
-        print(f"수집 시작: {input_file.name}, {last_line + 1:,}행부터", flush=True)
-
         batch = []
         batches = 0
-        inserted_count = skipped_count = 0
-        with input_file.open(encoding="utf-8", newline="") as counter:
-            total_lines = sum(1 for _ in counter)
-        # JSONL의 필드를 읽어 같은 이름의 DB 컬럼에 넣습니다.
-        with input_file.open(encoding="utf-8", newline="") as source, tqdm(
-            total=total_lines, initial=last_line, desc="수집", unit="행",
-            dynamic_ncols=True, mininterval=0.5, disable=not sys.stderr.isatty(),
-        ) as progress:
+        # newline=""으로 원본의 줄바꿈 표현까지 보존합니다.
+        with input_file.open(encoding="utf-8", newline="") as source:
             for line_number, raw_line in enumerate(source, start=1):
                 if line_number <= last_line:
                     continue
 
                 review = json.loads(raw_line)
-                unknown_columns = set(review) - REVIEW_COLUMNS
-                if unknown_columns:
-                    raise ValueError(f"DB 컬럼을 추가해야 하는 필드가 있습니다: {unknown_columns}")
                 user_id = review.get("user_id")
                 parent_asin = review.get("parent_asin")
                 timestamp = review.get("timestamp")
@@ -121,43 +95,21 @@ def main():
                         or type(timestamp) is not int):
                     raise ValueError(f"{line_number}행의 기본 키가 누락되었거나 형식이 잘못되었습니다.")
 
-                # NULL은 None으로 유지합니다. 본문 자르기나 공백 제거는 하지 않습니다.
-                # images는 리스트이므로 Json으로 감싸 JSONB 컬럼에 저장합니다.
-                images = review.get("images")
-                batch.append((
-                    user_id, parent_asin, timestamp,
-                    review.get("rating"),
-                    review.get("title"),
-                    review.get("text"),
-                    Json(images) if images is not None else None,
-                    review.get("asin"),
-                    review.get("helpful_vote"),
-                    review.get("verified_purchase"),
-                    input_file.name, line_number,
-                ))
+                batch.append((user_id, parent_asin, timestamp, raw_line, input_file.name, line_number))
                 if len(batch) == args.batch_size:
-                    inserted = save_batch(connection, batch, state_file, input_file)
-                    inserted_count += inserted
-                    skipped_count += len(batch) - inserted
-                    progress.set_postfix({"저장": f"{inserted_count:,}", "중복": f"{skipped_count:,}"}, refresh=False)
-                    progress.update(len(batch))
+                    save_batch(connection, batch, state_file, input_file)
                     last_line = line_number
                     batch = []
                     batches += 1
                     if args.max_batches is not None and batches >= args.max_batches:
-                        progress.close()
-                        print(f"수집 중단: {last_line:,}행까지, 저장 {inserted_count:,}건, 키 중복 스킵 {skipped_count:,}건", flush=True)
+                        print("지정한 배치 수까지 저장했습니다. 다음 실행에서 이어집니다.", flush=True)
                         return
 
-            if batch:
-                inserted = save_batch(connection, batch, state_file, input_file)
-                inserted_count += inserted
-                skipped_count += len(batch) - inserted
-                progress.set_postfix({"저장": f"{inserted_count:,}", "중복": f"{skipped_count:,}"}, refresh=False)
-                progress.update(len(batch))
-                last_line = batch[-1][-1]
+        if batch:
+            save_batch(connection, batch, state_file, input_file)
+            last_line = batch[-1][-1]
         save_state(state_file, input_file, last_line, completed=True)
-        print(f"수집 완료: {last_line:,}행, 이번 실행 저장 {inserted_count:,}건, 키 중복 스킵 {skipped_count:,}건", flush=True)
+        print(f"수집 완료: {last_line:,}행", flush=True)
     finally:
         connection.close()
 

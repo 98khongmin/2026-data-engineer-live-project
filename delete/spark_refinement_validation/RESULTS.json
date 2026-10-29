@@ -1,0 +1,16 @@
+{
+  "production_raw_rows": 694252,
+  "production_refined_rows": 693547,
+  "workers": [
+    "spark-worker-1",
+    "spark-worker-2"
+  ],
+  "allocated_cores_per_worker": 2,
+  "partitions": 4,
+  "sandbox_input_rows": 8,
+  "sandbox_inserted_rows": 6,
+  "sandbox_filtered_rows": 2,
+  "uuid5_matches_previous_rule": true,
+  "tqdm_verified": true,
+  "sandbox_database_removed": true
+}
