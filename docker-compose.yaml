@@ -132,7 +132,7 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-reviews}
       POSTGRES_USER: ${POSTGRES_USER:-reviews}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
-      INPUT_PATH: ${INPUT_PATH:-/opt/spark/data/All_Beauty.jsonl}
+      INPUT_PATH: ${INPUT_PATH:-https://huggingface.co/datasets/McAuley-Lab/Amazon-Reviews-2023/resolve/main/raw/review_categories/All_Beauty.jsonl}
       STATES_DIR: /opt/spark/states
       COLLECT_BATCH_SIZE: ${COLLECT_BATCH_SIZE:-1000}
     depends_on:

@@ -5,3 +5,15 @@ part*
 .part*
 *.crc
 _SUCCESS
+
+# OS & Python cache files
+.DS_Store
+*/.DS_Store
+__pycache__/
+*/__pycache__/
+*.pyc
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/
+
+# Archives
+*.zip

@@ -4,7 +4,9 @@
 
 - **데이터셋:** Amazon Reviews 2023의 `All_Beauty` 카테고리
 - **출처:** McAuley-Lab / Hugging Face Datasets (`McAuley-Lab/Amazon-Reviews-2023`)
-- **현재 입력:** 내려받은 정적 배치 파일 `data/All_Beauty.jsonl`
+- **현재 입력:** Hugging Face Datasets 직접 다운로드 URL (`All_Beauty.jsonl`)
+  - `https://huggingface.co/datasets/McAuley-Lab/Amazon-Reviews-2023/resolve/main/raw/review_categories/All_Beauty.jsonl`
+  - 수집기가 다운로드하여 `data/raw/All_Beauty.jsonl`에 적재 (이미 파일이 존재하면 다운로드 자동 스킵)
 - **입력 규모:** 701,528행, 326,611,506바이트(약 311.5 MiB)
 - **데이터 단위:** 사용자 리뷰 1건. 평점, 제목, 본문, 상품·사용자 식별자, 밀리초 단위 작성 시각 등을 포함합니다.
 
@@ -28,14 +30,13 @@
 
 ## 현재 구조와 도구 선정 이유
 
-데이터 레이크의 표준인 **메달리온 아키텍처(Medallion Architecture: Bronze → Silver → Gold)** 구조를 따릅니다.
-**수집기(JSONL) → Raw 파일 적재(`data/raw/`) → Spark 분산 정제/중복제거 → Processed Parquet(`data/processed/`) + PostgreSQL 일별 집계(`daily_review_summary`)**로 동작합니다.
+**수집기(JSONL) → 원본 적재(`data/raw/`) → Spark 일괄 로딩 및 중복 제거 → Parquet 저장(`data/processed/reviews/`) + PostgreSQL 일별 집계(`daily_review_summary`)** 흐름으로 동작합니다.
 
 | 계층 | 역할과 기술 스택 | 저장 포맷 및 위치 | 기본키(PK) / 식별자 |
 | :--- | :--- | :--- | :--- |
-| **1단계: Raw (Bronze)** | 수집기(`collector.py`)가 원본 JSONL을 Landing Zone에 보관 | JSONL (`data/raw/`) | 없음 (원시 로그 파일) |
-| **2단계: Processed (Silver)** | Spark가 읽어 결측치 정제 및 `review_id` 기준 분산 중복 제거 | Parquet (`data/processed/reviews/`)<br/>`partitionBy("review_date")` | `review_id` (UUID5: user_id + parent_asin + timestamp) |
-| **3단계: Aggregation (Gold)** | Spark가 일자별 리뷰 수, 평균 평점, 구매인증 수를 요약 집계하여 DB 적재 | PostgreSQL (`public.daily_review_summary`) | `review_date` (DATE PRIMARY KEY) |
+| **1단계: 원본 수집** | 수집기(`collector.py`)가 원본 JSONL을 파일로 보관 | JSONL (`data/raw/`) | 없음 (원시 로그 파일) |
+| **2단계: 정제 & 중복 제거** | Spark로 결측치 정제 및 `review_id` 기준 분산 중복 제거 | Parquet (`data/processed/reviews/`)<br/>`partitionBy("review_date")` | `review_id` (UUID5: user_id + parent_asin + timestamp) |
+| **3단계: 일별 집계** | Spark로 일자별 리뷰 수, 평균 평점 등을 요약 집계하여 DB 적재 | PostgreSQL (`public.daily_review_summary`) | `review_date` (DATE PRIMARY KEY) |
 
 ### 저장 포맷을 고른 이유
 
@@ -46,16 +47,36 @@
    - 일자별로 요약 집계된 데이터(약 6,500행)는 데이터 크기가 작고, Grafana 대시보드나 백엔드 서비스에서 빈번하고 빠른 포인트 조회가 일어납니다.
    - 인덱스와 트랜잭션(ACID)을 지원하는 RDBMS가 서빙 및 시각화 도구 연동에 가장 적합합니다.
 
-### 실행 명령
+### 실행 방법
 
-1. **수집기 실행 (원본 파일을 data/raw/ 에 적재)**:
-   ```bash
-   ./submit-job.sh collector.py
-   ```
-2. **Spark 정제 및 적재 실행**:
-   ```bash
-   ./submit-job.sh refine_reviews.py
-   ```
+파이프라인 실행은 호스트 머신의 `submit-job.sh` 스크립트를 통해 Docker 컨테이너 클러스터(`spark-master`) 내부로 전달되어 실행됩니다.
+
+#### 1. 인프라 컨테이너 실행 (사전 준비)
+```bash
+docker compose up -d
+```
+
+#### 2. 원본 데이터 수집 실행
+```bash
+./submit-job.sh jobs/collector.py
+```
+- 이미 `data/raw/All_Beauty.jsonl`이 존재하고 크기가 유효할 경우, 네트워크 다운로드를 자동으로 스킵합니다.
+- 처음부터 강제로 다시 다운로드 및 수집하려면 `--reset-state` 플래그를 추가합니다.
+
+#### 3. Spark 정제 및 요약 집계 실행
+```bash
+./submit-job.sh jobs/refine_reviews.py
+```
+
+#### 4. 결과 확인
+- **정제된 Parquet 파일 확인:**
+  ```bash
+  ls -lh data/processed/reviews/
+  ```
+- **PostgreSQL 일별 집계 테이블 조회:**
+  ```bash
+  docker compose exec postgres psql -U reviews -d reviews -c "SELECT * FROM daily_review_summary ORDER BY review_date DESC LIMIT 5;"
+  ```
 
 ### 실행 및 멱등성(동일 파일 중복 투입) 검증 결과
 
