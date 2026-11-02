@@ -1,4 +1,4 @@
-"""외부 원본 JSONL(로컬 파일 또는 Hugging Face URL)을 읽어 데이터 레이크 1단계(Raw Bronze)인 data/raw/ 에 적재하는 수집기 코드."""
+"""외부 원본 JSONL(로컬 파일 또는 Hugging Face URL)을 읽어 데이터 레이크 원본 저장소인 data/raw/ 에 적재하는 수집기 코드."""
 import argparse
 import json
 import os
@@ -104,18 +104,26 @@ def main():
     args = parser.parse_args()
 
     raw_dir = Path(args.raw_dir)
-    if not raw_dir.exists():
-        local_raw = Path("data/raw")
-        if local_raw.exists() or not raw_dir.parent.exists():
-            raw_dir = local_raw
-    raw_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        raw_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        if Path("/opt/airflow/data").exists():
+            raw_dir = Path("/opt/airflow/data/raw")
+            raw_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            raw_dir = Path("data/raw")
+            raw_dir.mkdir(parents=True, exist_ok=True)
 
     states_dir = Path(args.states_dir)
-    if not states_dir.exists():
-        local_states = Path("states")
-        if local_states.exists() or not states_dir.parent.exists():
-            states_dir = local_states
-    states_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        states_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        if Path("/opt/airflow/states").exists():
+            states_dir = Path("/opt/airflow/states")
+            states_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            states_dir = Path("states")
+            states_dir.mkdir(parents=True, exist_ok=True)
 
     is_url = args.input.startswith(("http://", "https://"))
     if is_url:

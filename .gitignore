@@ -6,9 +6,19 @@ part*
 *.crc
 _SUCCESS
 
+# Environment & Secrets
+.env
+.env.*
+!.env.example
+
+# Logs & Airflow Task Logs
+logs/
+*.log
+
 # OS & Python cache files
 .DS_Store
 */.DS_Store
+**/.DS_Store
 __pycache__/
 */__pycache__/
 *.pyc

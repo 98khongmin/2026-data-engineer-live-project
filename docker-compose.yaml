@@ -1,155 +1,280 @@
 name: amazon-review-pipeline
 
-x-spark: &spark
-  image: amazon-review-spark:3.5.9
-  build:
-    context: .
-  init: true
-  environment: &spark-env
+x-airflow-common:
+  &airflow-common
+  image: apache/airflow:3.3.1-python3.10
+  pull_policy: if_not_present
+  environment:
+    &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://postgres:postgres@postgres:5432/postgres
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql+psycopg2://postgres:postgres@postgres:5432/postgres
+    AIRFLOW__CELERY__BROKER_URL: redis://:@redis:6379/0
+    AIRFLOW__CORE__FERNET_KEY: 'us62Iyn_eVDHei9-uhpLn8Yon2JiiGcPBQyPq-Nc6Ps='
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'false'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: 'http://airflow-apiserver:8080/execution/'
+    AIRFLOW__API__AUTH_JWT_SECRET: 'airflow_super_secret_jwt_key_string_32b'
+    AIRFLOW__API_AUTH__JWT_ISSUER: 'airflow'
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+
+    # Spark 및 Postgres 연동 환경 변수 (postgres:postgres 계정 통일)
+    SPARK_MASTER_URL: spark://spark-master:7077
+    POSTGRES_HOST: postgres
+    POSTGRES_PORT: 5432
+    POSTGRES_DB: postgres
+    POSTGRES_USER: postgres
+    POSTGRES_PASSWORD: postgres
+
+    # Airflow Spark Connection (spark_default) 자동 등록 (JSON 포맷)
+    AIRFLOW_CONN_SPARK_DEFAULT: '{"conn_type": "spark", "host": "spark-master", "port": 7077}'
+
+    # Java 및 Spark 런타임 환경 변수
+    JAVA_HOME: /opt/java/openjdk
     SPARK_HOME: /opt/spark
-    PYSPARK_PYTHON: python3
-    PYSPARK_DRIVER_PYTHON: python3
-    SPARK_LOCAL_DIRS: /tmp/spark-local
+    PATH: /opt/spark/bin:/opt/java/openjdk/bin:/home/airflow/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+    # Airflow 환경 기본 데이터 경로
+    RAW_DIR: /opt/airflow/data/raw
+    STATES_DIR: /opt/airflow/states
+    PROCESSED_DIR: /opt/airflow/data/processed/reviews
+
+    # 경량 패키지 설치
+    _PIP_ADDITIONAL_REQUIREMENTS: --no-deps apache-airflow-providers-apache-spark>=6.3.0 psycopg2-binary requests boto3
+    AIRFLOW_CONFIG: '/opt/airflow/config/airflow.cfg'
   volumes:
-    - ./jobs:/opt/spark/app:ro
-    - ./scripts:/opt/spark/scripts:ro
-    - ./data:/opt/spark/data:rw
-    - ./states:/opt/spark/states:rw
-    - ./config/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
-  networks:
-    - pipeline-net
+    - ./dags:/opt/airflow/dags
+    - ./jobs:/opt/airflow/jobs
+    - ./scripts:/opt/airflow/scripts
+    - ./data:/opt/airflow/data
+    - ./states:/opt/airflow/states
+    - ./logs:/opt/airflow/logs
+    - ./config:/opt/airflow/config
+    - ./plugins:/opt/airflow/plugins
+    - spark-java-bin:/opt/java/openjdk:ro
+    - spark-bin:/opt/spark:ro
+  user: "50000:0"
+  depends_on:
+    &airflow-common-depends-on
+    redis:
+      condition: service_healthy
+    postgres:
+      condition: service_healthy
 
 services:
-  spark-master:
-    <<: *spark
-    hostname: spark-master
-    restart: unless-stopped
-    command:
-      - /opt/spark/bin/spark-class
-      - org.apache.spark.deploy.master.Master
-      - --host
-      - spark-master
-      - --port
-      - '7077'
-      - --webui-port
-      - '8080'
-    ports:
-      - '127.0.0.1:${SPARK_MASTER_UI_PORT:-8080}:8080'
-      - '127.0.0.1:${SPARK_MASTER_PORT:-7077}:7077'
-    healthcheck:
-      test: [ 'CMD', 'python3', '-c', 'import urllib.request; urllib.request.urlopen("http://localhost:8080/json/", timeout=3).read()' ]
-      interval: 10s
-      timeout: 5s
-      retries: 12
-      start_period: 20s
-
-  spark-worker-1:
-    <<: *spark
-    hostname: spark-worker-1
-    restart: unless-stopped
-    depends_on:
-      spark-master:
-        condition: service_healthy
-    command:
-      - /opt/spark/bin/spark-class
-      - org.apache.spark.deploy.worker.Worker
-      - --host
-      - spark-worker-1
-      - --webui-port
-      - '8081'
-      - --cores
-      - '${SPARK_WORKER_CORES:-2}'
-      - --memory
-      - '${SPARK_WORKER_MEMORY:-1536M}'
-      - spark://spark-master:7077
-    ports:
-      - '127.0.0.1:${SPARK_WORKER_1_UI_PORT:-8081}:8081'
-    healthcheck:
-      test: [ 'CMD', 'python3', '-c', 'import urllib.request; urllib.request.urlopen("http://localhost:8081/json/", timeout=3).read()' ]
-      interval: 10s
-      timeout: 5s
-      retries: 12
-      start_period: 20s
-
-  spark-worker-2:
-    <<: *spark
-    hostname: spark-worker-2
-    restart: unless-stopped
-    depends_on:
-      spark-master:
-        condition: service_healthy
-    command:
-      - /opt/spark/bin/spark-class
-      - org.apache.spark.deploy.worker.Worker
-      - --host
-      - spark-worker-2
-      - --webui-port
-      - '8081'
-      - --cores
-      - '${SPARK_WORKER_CORES:-2}'
-      - --memory
-      - '${SPARK_WORKER_MEMORY:-1536M}'
-      - spark://spark-master:7077
-    ports:
-      - '127.0.0.1:${SPARK_WORKER_2_UI_PORT:-8082}:8081'
-    healthcheck:
-      test: [ 'CMD', 'python3', '-c', 'import urllib.request; urllib.request.urlopen("http://localhost:8081/json/", timeout=3).read()' ]
-      interval: 10s
-      timeout: 5s
-      retries: 12
-      start_period: 20s
-
   postgres:
     image: postgres:16-bookworm
-    restart: unless-stopped
+    container_name: postgres
     environment:
-      POSTGRES_DB: ${POSTGRES_DB:-reviews}
-      POSTGRES_USER: ${POSTGRES_USER:-reviews}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
     ports:
-      - '127.0.0.1:${POSTGRES_PORT:-5432}:5432'
+      - "5432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
       - ./postgres/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      test: [ 'CMD-SHELL', 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"' ]
-      interval: 5s
-      timeout: 5s
-      retries: 20
-      start_period: 10s
-    networks:
-      - pipeline-net
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
 
-  spark-job:
-    <<: *spark
-    profiles: [ 'jobs' ]
-    hostname: spark-job
-    restart: 'no'
-    environment:
-      <<: *spark-env
-      POSTGRES_HOST: postgres
-      POSTGRES_PORT: '5432'
-      POSTGRES_DB: ${POSTGRES_DB:-reviews}
-      POSTGRES_USER: ${POSTGRES_USER:-reviews}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
-      INPUT_PATH: ${INPUT_PATH:-https://huggingface.co/datasets/McAuley-Lab/Amazon-Reviews-2023/resolve/main/raw/review_categories/All_Beauty.jsonl}
-      STATES_DIR: /opt/spark/states
-      COLLECT_BATCH_SIZE: ${COLLECT_BATCH_SIZE:-1000}
+  redis:
+    image: redis:7.2-bookworm
+    container_name: redis
+    expose:
+      - 6379
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 30s
+      retries: 50
+      start_period: 30s
+    restart: always
+
+  spark-master:
+    image: apache/spark:4.2.0
+    container_name: spark-master
+    ports:
+      - "8081:8080"   # Airflow UI(8080)와 포트 충돌 방지
+      - "7077:7077"
+      - "4040:4040"
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+    volumes:
+      - spark-java-bin:/opt/java/openjdk
+      - spark-bin:/opt/spark
+      - ./dags:/opt/spark/dags
+      - ./jobs:/opt/spark/app
+      - ./jobs:/opt/airflow/jobs
+      - ./scripts:/opt/spark/scripts
+      - ./data:/opt/spark/data
+      - ./data:/opt/airflow/data
+      - ./states:/opt/spark/states
+    restart: always
+
+  spark-worker-1:
+    image: apache/spark:4.2.0
+    container_name: spark-worker-1
+    user: root
     depends_on:
-      spark-master:
-        condition: service_healthy
-      spark-worker-1:
-        condition: service_healthy
-      spark-worker-2:
-        condition: service_healthy
-      postgres:
-        condition: service_healthy
-    command:
-      - /bin/bash
-      - /opt/spark/scripts/run-job.sh
-      - collector.py
+      - spark-master
+    environment:
+      - SPARK_WORKER_MEMORY=2g
+      - SPARK_WORKER_CORES=2
+    command: >
+      bash -c "pip install pyarrow && /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077"
+    volumes:
+      - ./jobs:/opt/spark/app
+      - ./jobs:/opt/airflow/jobs
+      - ./scripts:/opt/spark/scripts
+      - ./data:/opt/spark/data
+      - ./data:/opt/airflow/data
+      - ./states:/opt/spark/states
+    restart: always
 
-networks:
-  pipeline-net:
+  spark-worker-2:
+    image: apache/spark:4.2.0
+    container_name: spark-worker-2
+    user: root
+    depends_on:
+      - spark-master
+    environment:
+      - SPARK_WORKER_MEMORY=2g
+      - SPARK_WORKER_CORES=2
+    command: >
+      bash -c "pip install pyarrow && /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077"
+    volumes:
+      - ./jobs:/opt/spark/app
+      - ./jobs:/opt/airflow/jobs
+      - ./scripts:/opt/spark/scripts
+      - ./data:/opt/spark/data
+      - ./data:/opt/airflow/data
+      - ./states:/opt/spark/states
+    restart: always
+
+  airflow-apiserver:
+    <<: *airflow-common
+    container_name: airflow-apiserver
+    command: api-server
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: scheduler
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - 'airflow jobs check --job-type SchedulerJob --hostname "`hostname`"'
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    container_name: airflow-dag-processor
+    command: dag-processor
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - 'airflow jobs check --job-type DagProcessorJob --hostname "`hostname`"'
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-worker:
+    <<: *airflow-common
+    container_name: airflow-worker
+    command: celery worker
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - >
+          celery --app airflow.providers.celery.executors.celery_executor.app inspect ping -d "celery@`hostname`" ||
+          celery --app airflow.executors.celery_executor.app inspect ping -d "celery@`hostname`" || exit 0
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    environment:
+      <<: *airflow-common-env
+      DUMB_INIT_SETSID: "0"
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      spark-master:
+        condition: service_started
+      airflow-apiserver:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-triggerer:
+    <<: *airflow-common
+    container_name: airflow-triggerer
+    command: triggerer
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - 'airflow jobs check --job-type TriggererJob --hostname "`hostname`"'
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        mkdir -v -p /opt/airflow/{logs,config,plugins,dags,jobs,scripts,data,states}
+
+        chown -R 50000:0 /opt/airflow/{logs,config,plugins,dags,jobs,scripts,data,states}
+        exec /entrypoint airflow version
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: airflow
+      _AIRFLOW_WWW_USER_PASSWORD: airflow
+      _PIP_ADDITIONAL_REQUIREMENTS: ''
+    user: "0:0"
+
 volumes:
   postgres-data:
+  spark-java-bin:
+  spark-bin:
