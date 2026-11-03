@@ -83,14 +83,9 @@ docker compose up -d
 
 ## Airflow DAG 설계 및 구현
 
-월별 Amazon 리뷰 데이터 파이프라인([`dags/dag.py`](file:///Users/steven/Documents/메타코드_Local/2026-data-engineer-live-project/dags/dag.py))의 4단계 자동화 및 오케스트레이션 명세입니다.
+월별 Amazon 리뷰 데이터 파이프라인 dag.py의 4단계 자동화 및 오케스트레이션 명세입니다.
 
 ### 1. DAG 구조 (단일 파이프라인 4단계 순차 체이닝)
-
-```mermaid
-flowchart LR
-    A["download_raw_data<br/>(수집기: collector.py)"] --> B["refine_store_parquet<br/>(Spark: 정제 및 Parquet 저장)"] --> C["aggregate_monthly<br/>(Spark: 월별 집계 및 DB 적재)"] --> D["validate_data<br/>(품질 검증: SQL)"]
-```
 
 * **`download_raw_data`**: 외부 원본 JSONL 다운로드 (기존 파일 존재 시 자동 스킵)
 * **`refine_store_parquet`**: 스키마 적용 및 중복 제거 후 월별 Parquet 저장 (해당 월 파티션 이미 존재 시 스킵)
@@ -117,18 +112,6 @@ flowchart LR
   - **정기 실행 전환 방법**: 현재 시점 기준 매월 실시간 파이프라인으로 전환하려면 `end_date` 파라미터를 제거하면 되며, 과거 특정 월 테스트는 Airflow UI의 `Trigger DAG w/ config`에서 `{"year_month": "2023-01"}`로 즉시 실행할 수 있습니다.
 * **순서 선정 이유**: 원본 다운로드 ➔ 정제 Parquet 저장 ➔ DB 요약 집계 ➔ 품질 검증의 단계별 입력 데이터 의존성 보장
 * **리플레이 날짜 매핑**: 과거(2023년) 데이터를 재현하므로, Airflow 실행 날짜 대신 파라미터(`data_interval_start`의 `YYYY-MM`)를 과거 데이터 월과 1:1로 매핑하여 처리
-
-### 4. 피드백 체크리스트 & 보너스 과제 (멱등성)
-
-* **스키마 직접 정의**: Spark `StructType`으로 필드 불일치 즉시 감지
-* **품질 검증 조건 강화**: 총 집계 월수 0건 체크뿐 아니라, `invalid_reviews > 0`(리뷰 수 <= 0인 비정상 행) 및 `invalid_ratings > 0`(평점 1~5점 이탈)을 모두 감지하여 즉시 예외(`ValueError`)를 발생시킴
-* **장애 복구**: 수집 상태 파일 및 월별 Parquet 파티션 사전 감지 스킵(0.1초) 탑재
-* **멱등성(Idempotency)**: PostgreSQL `review_year_month` PK 업서트(`ON CONFLICT DO UPDATE`) 적용으로 **같은 날짜를 여러 번 실행해도 데이터 중복 없이 최신 상태 유지**
-
-```bash
-# 동일 월(2023-01) 2회 실행 후 멱등성 검증 쿼리 (단 1행 유지 및 updated_at만 갱신)
-docker compose exec postgres psql -U postgres -d postgres -c "SELECT review_year_month, total_reviews, avg_rating, updated_at FROM monthly_review_summary WHERE review_year_month = '2023-01';"
-```
 
 
 ### 5. 환경 설정 및 Git 보안 관리
