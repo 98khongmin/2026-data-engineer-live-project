@@ -1,4 +1,9 @@
 *.jsonl
+*.json
+*.lock_convert_raw
+*.lock_all
+*.txt
+.gitignore
 
 # Spark output & partition files
 part*
