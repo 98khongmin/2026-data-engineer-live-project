@@ -61,7 +61,10 @@ def download_from_url(url: str, target_file: Path, chunk_size: int = 1024 * 1024
 
             with temp_file.open("wb") as f:
                 if tqdm and total_size > 0:
-                    with tqdm(total=total_size, unit="B", unit_scale=True, unit_divisor=1024, desc=f"다운로드 {target_file.name}") as pbar:
+                    with tqdm(
+                        total=total_size, unit="B", unit_scale=True, unit_divisor=1024,
+                        desc=f"다운로드 {target_file.name}",
+                    ) as pbar:
                         while True:
                             chunk = response.read(chunk_size)
                             if not chunk:
@@ -78,7 +81,12 @@ def download_from_url(url: str, target_file: Path, chunk_size: int = 1024 * 1024
                         downloaded += len(chunk)
                         if total_size > 0:
                             percent = (downloaded / total_size) * 100
-                            print(f"\r[수집기] 다운로드 중: {downloaded / (1024 * 1024):.1f}MB / {total_size / (1024 * 1024):.1f}MB ({percent:.1f}%)", end="", flush=True)
+                            mb_down = downloaded / (1024 * 1024)
+                            mb_total = total_size / (1024 * 1024)
+                            print(
+                                f"\r[수집기] 다운로드 중: {mb_down:.1f}MB / {mb_total:.1f}MB ({percent:.1f}%)",
+                                end="", flush=True,
+                            )
                     if total_size > 0:
                         print("", flush=True)
 
@@ -95,8 +103,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--input",
-        default=os.getenv("INPUT_PATH", DEFAULT_HUGGINGFACE_URL),
-        help="수집할 원본 파일의 URL(HTTP/HTTPS) 또는 로컬 파일 경로",
+        default=os.getenv("INPUT_PATH", ""),
+        help="수집할 원본 파일의 URL(HTTP/HTTPS) 또는 로컬 파일 경로 (비어있을 시 로컬 category 파일 확인)",
+    )
+    parser.add_argument(
+        "--category",
+        default=os.getenv("CATEGORY", "All_Beauty"),
+        help="수집 대상 카테고리 이름 (예: All_Beauty, Appliances 등)",
     )
     parser.add_argument("--raw-dir", default=os.getenv("RAW_DIR", "/opt/spark/data/raw"))
     parser.add_argument("--states-dir", default=os.getenv("STATES_DIR", "/opt/spark/states"))
@@ -125,6 +138,22 @@ def main():
             states_dir = Path("states")
             states_dir.mkdir(parents=True, exist_ok=True)
 
+    # URL/입력 경로가 비어있는 경우 로컬 파일 확인
+    if not args.input or not args.input.strip():
+        target_file = raw_dir / f"{args.category}.jsonl"
+        if target_file.exists() and target_file.stat().st_size > 0:
+            with target_file.open(encoding="utf-8", newline="") as f:
+                line_count = sum(1 for _ in f)
+            print(f"[수집기] --input URL이 비어있으나 로컬 파일({target_file})이 정상 존재합니다. "
+                  f"다운로드를 생략합니다: 총 {line_count:,}행 ({target_file.stat().st_size:,} 바이트)", flush=True)
+            state_file = states_dir / f"collector_{target_file.stem}.json"
+            save_state(state_file, target_file.name, target_file.stat().st_size, line_count, completed=True)
+            return
+        else:
+            raise FileNotFoundError(
+                f"[수집기 오류] --input URL이 비어있고, 로컬에 {target_file} 파일도 존재하지 않습니다! 수집을 중단합니다."
+            )
+
     is_url = args.input.startswith(("http://", "https://"))
     if is_url:
         parsed_url = urllib.parse.urlparse(args.input)
@@ -152,7 +181,11 @@ def main():
         if is_url or (input_file.resolve() == target_file.resolve() or input_file.stat().st_size == target_file.stat().st_size):
             with target_file.open(encoding="utf-8", newline="") as f:
                 line_count = sum(1 for _ in f)
-            print(f"[수집기] 이미 {target_file} 에 파일이 존재하여 다운로드를 스킵합니다: 총 {line_count:,}행 ({target_file.stat().st_size:,} 바이트)", flush=True)
+            print(
+                f"[수집기] 이미 {target_file} 에 파일이 존재하여 다운로드를 스킵합니다: "
+                f"총 {line_count:,}행 ({target_file.stat().st_size:,} 바이트)",
+                flush=True,
+            )
             save_state(state_file, target_file.name, target_file.stat().st_size, line_count, completed=True)
             return
 

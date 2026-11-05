@@ -38,7 +38,8 @@ x-airflow-common:
     # Airflow 환경 기본 데이터 경로
     RAW_DIR: /opt/airflow/data/raw
     STATES_DIR: /opt/airflow/states
-    PROCESSED_DIR: /opt/airflow/data/processed/reviews
+    DEFAULT_CATEGORY: All_Beauty
+    PROCESSED_DIR: /opt/airflow/data/processed/All_Beauty
 
     # 경량 패키지 설치
     _PIP_ADDITIONAL_REQUIREMENTS: --no-deps apache-airflow-providers-apache-spark>=6.3.0 psycopg2-binary requests boto3
