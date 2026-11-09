@@ -325,6 +325,7 @@ def upsert_staging_to_metrics(db_config, staging_table, target_table):
     """PostgreSQL staging 테이블의 상품 월별 지표를 target 마트 테이블에 원자적 UPSERT 병합합니다."""
     upsert_sql = f"""
     SET LOCAL synchronous_commit = 'off';
+    SET LOCAL work_mem = '64MB';
     INSERT INTO {target_table} (
         category, product_id, review_year_month, review_quarter, total_reviews,
         avg_rating, verified_reviews, helpful_votes_sum, positive_reviews, negative_reviews, updated_at
@@ -358,6 +359,7 @@ def upsert_staging_to_segments(db_config, staging_table, target_table):
     """저리뷰 vs 다리뷰 세그먼트 비교 결과를 PostgreSQL target 테이블에 UPSERT 병합합니다."""
     upsert_sql = f"""
     SET LOCAL synchronous_commit = 'off';
+    SET LOCAL work_mem = '64MB';
     INSERT INTO {target_table} (
         category, segment_rule, analysis_start_month, analysis_end_month, segment_type,
         threshold_p20_reviews, threshold_p80_reviews, product_count, total_reviews_sum,
@@ -403,7 +405,7 @@ def run_aggregate_metrics(spark, args, db_config, profiler=None):
     is_incremental = bool(target_ym and target_ym.lower() not in ("all", "auto", ""))
     measure_ctx = profiler.measure if profiler else _dummy_measure
 
-    with measure_ctx("1. Parquet 데이터 로딩", component="SPARK_IO") as m:
+    with measure_ctx("1. Parquet 로딩 및 상품-월별 집계 연산", component="SPARK_COMPUTE") as m:
         if is_incremental:
             partition_path = os.path.join(args.processed_dir, f"review_year_month={target_ym}")
             if os.path.exists(partition_path):
@@ -416,31 +418,23 @@ def run_aggregate_metrics(spark, args, db_config, profiler=None):
             print("[상품 마트 집계] 전체 파티션 Parquet 로딩", flush=True)
             df = spark.read.parquet(args.processed_dir)
 
-        record_count = df.count()
-        m["count"] = record_count
-        print(f"[상품 마트 집계] 읽어들인 리뷰 레코드 수: {record_count:,}건", flush=True)
+        # 분기 식별자 컬럼 (YYYY-Q#)
+        quarter_expr = F.concat(
+            F.substring(F.col("review_year_month"), 1, 4),
+            F.lit("-Q"),
+            F.when(F.substring(F.col("review_year_month"), 6, 2).isin("01", "02", "03"), "1")
+             .when(F.substring(F.col("review_year_month"), 6, 2).isin("04", "05", "06"), "2")
+             .when(F.substring(F.col("review_year_month"), 6, 2).isin("07", "08", "09"), "3")
+             .otherwise("4"),
+        )
 
-    if record_count == 0:
-        print("[상품 마트 집계 알림] 처리할 리뷰 데이터가 없어 작업을 종료합니다.", flush=True)
-        return
+        helpful_expr = (
+            F.coalesce(F.col("helpful_vote"), F.lit(0)).cast("long")
+            if "helpful_vote" in df.columns
+            else F.lit(0).cast("long")
+        )
 
-    # 분기 식별자 컬럼 (YYYY-Q#)
-    quarter_expr = F.concat(
-        F.substring(F.col("review_year_month"), 1, 4),
-        F.lit("-Q"),
-        F.when(F.substring(F.col("review_year_month"), 6, 2).isin("01", "02", "03"), "1")
-         .when(F.substring(F.col("review_year_month"), 6, 2).isin("04", "05", "06"), "2")
-         .when(F.substring(F.col("review_year_month"), 6, 2).isin("07", "08", "09"), "3")
-         .otherwise("4"),
-    )
-
-    helpful_expr = (
-        F.coalesce(F.col("helpful_vote"), F.lit(0)).cast("long")
-        if "helpful_vote" in df.columns
-        else F.lit(0).cast("long")
-    )
-
-    with measure_ctx("2. 상품-월별 집계 연산", component="SPARK_COMPUTE") as m:
+        # 🚨 최적화: 단순 카운트용 df.count()를 제거하고 groupBy 집계 연산과 통합하여 단 1회의 디스크 스캔으로 처리
         print(f"[상품 마트 집계] ({category}) 상품별(product_id) x 월별(review_year_month) 집계 수행...", flush=True)
         metrics_df = (
             df.groupBy("product_id", "review_year_month")
@@ -460,6 +454,11 @@ def run_aggregate_metrics(spark, args, db_config, profiler=None):
         metrics_count = metrics_df.count()
         m["count"] = metrics_count
         print(f"[상품 마트 집계] 산출된 상품-월별 마트 레코드 수: {metrics_count:,}건", flush=True)
+
+    if metrics_count == 0:
+        print("[상품 마트 집계 알림] 처리할 리뷰 데이터가 없어 작업을 종료합니다.", flush=True)
+        metrics_df.unpersist()
+        return
 
     jdbc_url = (
         f"jdbc:postgresql://{db_config['host']}:{db_config['port']}/{quote(db_config['dbname'], safe='')}"
@@ -505,10 +504,12 @@ def run_analyze_segments(spark, args, db_config, profiler=None):
         "?reWriteBatchedInserts=true"
     )
 
-    with measure_ctx("5. 세그먼트용 마트 JDBC 로드", component="POSTGRES_READ") as m:
+    with measure_ctx("5. 세그먼트용 마트 JDBC 병렬 로드 (8-파티션)", component="POSTGRES_READ") as m:
+        num_read_parts = 8
         cols_query = (
             f"(SELECT category, product_id, review_year_month, total_reviews, avg_rating, "
-            f"verified_reviews, positive_reviews, negative_reviews "
+            f"verified_reviews, positive_reviews, negative_reviews, "
+            f"(hashtext(product_id) & 7) AS part_id "
             f"FROM {args.metrics_table} WHERE category = '{category}') AS metrics_sub"
         )
         metrics_df = (
@@ -520,18 +521,23 @@ def run_analyze_segments(spark, args, db_config, profiler=None):
             .option("password", db_config["password"])
             .option("driver", "org.postgresql.Driver")
             .option("fetchsize", "10000")
+            .option("partitionColumn", "part_id")
+            .option("lowerBound", "0")
+            .option("upperBound", "7")
+            .option("numPartitions", str(num_read_parts))
             .load()
-        )
+        ).cache()
 
         metrics_count = metrics_df.count()
         m["count"] = metrics_count
 
     if metrics_count == 0:
+        metrics_df.unpersist()
         print("[세그먼트 분석 알림] 상품 마트 테이블에 데이터가 없어 세그먼트 분석을 생략합니다.", flush=True)
         return
 
     with measure_ctx("6. 분위수 및 세그먼트 집계", component="SPARK_COMPUTE") as m:
-        # 분석 대상 기간(시작월, 마감월) 동적 추출
+        # 분석 대상 기간(시작월, 마감월) 동적 추출 (캐시된 metrics_df에서 즉시 조회)
         period_row = metrics_df.select(
             F.min("review_year_month").alias("start_ym"),
             F.max("review_year_month").alias("end_ym"),
@@ -541,7 +547,7 @@ def run_analyze_segments(spark, args, db_config, profiler=None):
 
         print(f"[세그먼트 분석] 분석 대상 기간: {start_ym} ~ {end_ym}", flush=True)
 
-        # 상품별 전체 누적 지표 집계
+        # 상품별 전체 누적 지표 집계 (중복 shuffle 방지를 위해 cache 적용)
         prod_totals = (
             metrics_df.groupBy("product_id")
             .agg(
@@ -551,13 +557,13 @@ def run_analyze_segments(spark, args, db_config, profiler=None):
                 F.sum("positive_reviews").cast("long").alias("lifetime_positive"),
                 F.sum("negative_reviews").cast("long").alias("lifetime_negative"),
             )
-        )
+        ).cache()
 
         prod_count = prod_totals.count()
         print(f"[세그먼트 분석] 분석 대상 고유 상품 수: {prod_count:,}개", flush=True)
 
-        # 하위 20%(p20) 및 상위 20%(p80) 분위수 임계치 산출
-        quantiles = prod_totals.approxQuantile("lifetime_reviews", [0.20, 0.80], 0.01)
+        # 하위 20%(p20) 및 상위 20%(p80) 분위수 임계치 산출 (GK 알고리즘 연산 가속: relativeError 0.01 -> 0.05)
+        quantiles = prod_totals.approxQuantile("lifetime_reviews", [0.20, 0.80], 0.05)
         p20 = int(quantiles[0])
         p80 = int(quantiles[1])
         if p80 <= p20:
@@ -620,6 +626,8 @@ def run_analyze_segments(spark, args, db_config, profiler=None):
         upsert_staging_to_segments(db_config, staging_table, args.segment_table)
 
     segment_summary.unpersist()
+    prod_totals.unpersist()
+    metrics_df.unpersist()
 
 
 def main():

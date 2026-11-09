@@ -400,11 +400,13 @@ def run_sentiment_analysis(spark, args, db_config):
         print("[감정분석] 전체 파티션 Parquet 로딩", flush=True)
         df = spark.read.parquet(args.processed_dir)
 
-    record_count = df.count()
-    print(f"[감정분석] 읽어들인 리뷰 레코드 수: {record_count:,}건", flush=True)
-    if record_count == 0:
+    # 입력 존재 여부만 확인한다. 전체 count()는 파일 전체를 먼저 스캔한 뒤
+    # 실제 감정 분석에서 다시 읽게 하므로, 대용량 월 파티션에서 불필요한 I/O가 된다.
+    has_records = bool(df.take(1))
+    if not has_records:
         print("[감정분석 알림] 처리할 리뷰 데이터가 없어 작업을 정상 종료합니다.", flush=True)
         return
+    print("[감정분석] 입력 리뷰 확인 완료 (전체 건수 스캔 생략)", flush=True)
 
     # 필수 컬럼 정규화 (review_text 및 review_title)
     if "review_text" in df.columns:

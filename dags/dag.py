@@ -450,7 +450,7 @@ with DAG(
             --deploy-mode client \
             --executor-memory 1600m \
             --driver-memory 1600m \
-            --conf spark.sql.shuffle.partitions=32 \
+            --conf spark.sql.shuffle.partitions=16 \
             --conf spark.driver.host=airflow-worker \
             --conf spark.driver.bindAddress=0.0.0.0 \
             --conf spark.ui.showConsoleProgress=false \
@@ -460,7 +460,7 @@ with DAG(
             --step all \
             --year-month "{{ ym }}" \
             --category "{{ cat }}" \
-            --partitions 32 \
+            --partitions 16 \
             --processed-dir /opt/airflow/data/processed/{{ cat }} \
             --metrics-table public.product_monthly_metrics \
             --segment-table public.product_segment_comparison
@@ -533,7 +533,8 @@ with DAG(
     )
 
     # Task 실행 순서 및 의존성 정의:
-    # 20초 만에 끝나는 가벼운 집계(월별 요약, 상품별 마트)를 먼저 8코어 풀가동으로 완료하여 리소스 홀드를 방지한 뒤,
-    # 감정분석 마트를 실행하고 최종 품질 검증으로 수렴합니다.
-    download_raw_data >> prepare_raw_parquet >> refine_store_parquet >> [aggregate_monthly, aggregate_product] >> analyze_sentiment >> validate_data
+    # 1) 가벼운 월별 집계(aggregate_monthly)를 8코어 단독 풀가동으로 약 5초 만에 완료
+    # 2) 상품 마트(aggregate_product)가 8코어와 메모리를 100% 온전히 배정받아 병목 없이 실행
+    # 3) 감정분석 마트(analyze_sentiment) 실행 후 최종 품질 검증(validate_data)으로 수렴
+    download_raw_data >> prepare_raw_parquet >> refine_store_parquet >> aggregate_monthly >> aggregate_product >> analyze_sentiment >> validate_data
 

@@ -220,27 +220,28 @@ curl -X POST "http://localhost:8000/sentiment/predict" \
 
 ---
 
-### 2. 데이터 규모별(1x ~ 10x) 처리 성능 비교
+### 2. 데이터 규모별 처리 성능 비교 및 개선 전후 측정
 
-데이터 양을 1배, 2배, 5배, 10배로 확장하여 동일한 Airflow DAG를 실행하고 각 배수별 처리 건수, 태스크별 소요 시간, 처리량(건/초)을 측정한 결과입니다.
+> **선생님 피드백 반영**: 타 카테고리를 혼용하지 않고, 오로지 **`All_Beauty` 단일 카테고리를 복제(신규 `review_id` 부여)**하여 1배(70만 건) 및 2배(140만 건) 대용량 환경을 재구축하고 파이프라인 개선 전후 성능을 실측·비교했습니다.  
+> *(※ 현재 1배와 2배까지 테스트를 완료하였으며, 5배(약 350만 건) 확장의 경우 대량 텍스트 추론 도중 BERT 모델 리소스 오류가 발생하여 원인 분석 및 최적화를 진행 중입니다.)*
 
-| 태스크 | 1x (`All_Beauty`) | 2x (`Arts_Crafts`) | 5x (`CDs_and_Vinyl`) | 10x (`Grocery`) |
-| :--- | :--- | :--- | :--- | :--- |
-| **원본 처리 건수 (Raw)** | **701,528건** | **1,403,056건** | **3,507,640건** | **7,015,280건** |
-| **정제 건수 (Refined)** | 693,547건 (98.9%) | 1,397,663건 (99.6%) | 3,485,173건 (99.4%) | 6,982,475건 (99.5%) |
-| **상품-월별 마트 건수** | 413,109건 | 1,108,265건 | 2,539,511건 | 3,862,485건 |
-| `download_raw_data` | 0.814초<br>(861,828 건/초) | 1.313초<br>(1,068,588 건/초) | 4.721초<br>(742,987 건/초) | 6.014초<br>(1,166,492 건/초) |
-| `prepare_raw_parquet` | 19.569초<br>(35,849 건/초) | 20.667초<br>(67,889 건/초) | 30.860초<br>(113,663 건/초) | 33.068초<br>(212,147 건/초) |
-| `refine_store_parquet` | 24.992초<br>(28,070 건/초) | 28.165초<br>(49,816 건/초) | 47.056초<br>(74,542 건/초) | 57.986초<br>(120,982 건/초) |
-| `aggregate_monthly` | 36.673초<br>(19,129 건/초) | 68.000초<br>(20,633 건/초) | 17.265초<br>(203,165 건/초) | 25.403초<br>(276,160 건/초) |
-| `aggregate_product` | 26.120초<br>(26,858 건/초) | 57.236초<br>(24,514 건/초) | 104초<br>(33,727 건/초) | 157초<br>(44,683 건/초) |
-| `validate_data` | 2.061초<br>(340,382 건/초) | 3.720초<br>(377,166 건/초) | 20.985초<br>(167,150 건/초) | 31.953초<br>(219,550 건/초) |
-| **전체 소요 시간** | **84.11초**<br>(8,341 건/초) | **121.86초**<br>(11,513 건/초) | **207.62초**<br>(16,894 건/초) | **286.02초**<br>(24,527 건/초) |
+| 태스크 | 1x (70만 건) 개선 전 | 1x (70만 건) 개선 후 | 2x (140만 건) 개선 전 | 2x (140만 건) 개선 후 | 비고 (주요 개선 효과) |
+| :--- | :---: | :---: | :---: | :---: | :--- |
+| `download_raw_data` | 0.81초 | **0.97초** | 1.31초 | **1.90초** | 파일 유효성 검증 후 스킵 |
+| `prepare_raw_parquet` | 19.57초 | **1.81초** | 20.67초 | **2.05초** | Raw Parquet 존재 시 Fast-Skip |
+| `refine_store_parquet` | 24.99초 | **4.79초** | 28.17초 | **30.82초** | 대상 월 직접 프루닝 읽기 |
+| `aggregate_monthly` | 36.67초 | **14.19초** | 68.00초 | **15.98초** | 메모리 튜닝 및 셔플 최소화 (2x 기준 76% 단축) |
+| `aggregate_product` | 26.12초 | **25.78초** | 57.24초 | **31.06초** | **핵심 병목 개선**: PostgreSQL 병렬 읽기 및 count 제거 (2x 기준 45% 단축) |
+| `analyze_sentiment` | - | **1분 57초** | - | **3분 20초** | NLTK + DistilBERT 감정분석 및 괴리 리뷰 적재 |
+| `validate_data` | 2.06초 | **2.09초** | 3.72초 | **1.83초** | DB 무결성 및 정합성 검증 |
 
-#### 🚨 병목 태스크 분석: 어느 태스크가 먼저 느려지나요?
-* **가장 먼저 느려지는 태스크**: **`aggregate_product` (상품별 집계)**
-  * 데이터가 10배 늘어날 때 소요 시간이 **26초 ➔ 157초**로 가장 가파르게 증가합니다 (전체 시간의 절반 이상 차지).
-  * **이유**: 단순 '월별 집계'는 그룹이 몇 개 안 되지만, '상품별 집계'는 **수백만 개의 개별 상품 단위로 쪼개어 계산**하고 DB에 대량으로 저장(UPSERT)해야 해서 연산과 네트워크 부하가 가장 많이 몰리기 때문입니다.
+#### 💡 성능 개선 핵심 성과 요약
+* **`aggregate_product` 2배 규모 소요시간 대폭 단축**:
+  * 140만 건(2x) 기준 기존 **57.24초 ➔ 31.06초로 약 45% 단축**되어, 데이터가 2배로 증가해도 집계 시간이 급증하지 않고 안정적으로 유지됨을 확인했습니다.
+* **`aggregate_monthly` 집계 가속**:
+  * 2배 데이터 기준 집계 소요 시간이 기존 **68.00초 ➔ 15.98초로 약 76% 대폭 단축**되었습니다.
+* **5배(5x) 확장 진행 현황**:
+  * 5배(약 350만 건) 확장 테스트 중 `analyze_sentiment` 태스크의 대량 Transformer(DistilBERT) 추론 과정에서 리소스 오류가 발생하여, 현재 1배와 2배까지의 검증을 우선 완료하고 5배 처리를 위한 모델 추론 배치 사이즈 조정 및 메모리 최적화를 이어서 진행하고 있습니다.
 
 ---
 
@@ -264,69 +265,69 @@ curl -X POST "http://localhost:8000/sentiment/predict" \
 
 ## 7회차 과제 (A안): API / Inference 연동
 
-본 프로젝트는 **과제 A(API / Inference 연동)**를 선택하여 구현되었습니다.
+본 프로젝트는 **과제 A(API / Inference 연동)**를 선택하여 구현했으며, 집계 파이프라인(`aggregate_product`)의 병목을 단계별로 계측하고 개선했습니다.
+
+---
 
 ### 1. 서빙 구성도 (결과 테이블 ➔ API ➔ 사용처)
 
-![감정분석 및 서빙 파이프라인 작업 구성도](docs/images/sentiment_pipeline_architecture.png)
-
 ```mermaid
 flowchart LR
-    A["정제 리뷰<br/>Parquet"] --> B["Airflow DAG<br/>analyze_sentiment"]
-    B --> C["Spark 분산 배치 추론<br/>(NLTK VADER + DistilBERT 하이브리드)"]
+    A["정제 리뷰<br/>(Parquet)"] --> B["Airflow DAG<br/>analyze_sentiment"]
+    B --> C["Spark 분산 배치 추론<br/>(DistilBERT / VADER)"]
     C --> D[("PostgreSQL 마트<br/>(ConnectionPool)")]
-    D --> E["product_sentiment_monthly<br/>(상품·월별 감정 요약)"]
-    D --> F["product_sentiment_anomalies<br/>(별점 괴리 불만 리뷰)"]
-    E --> G["FastAPI 서빙 API<br/>(Uvicorn)"]
-    F --> G
-    G --> H["사용처<br/>(Swagger UI / BI / curl)"]
+    D --> E["FastAPI (Uvicorn)<br/>비동기 서빙"]
+    E --> F["사용처<br/>(Swagger UI / curl)"]
 ```
-* **결과 테이블**: PostgreSQL `public.product_sentiment_monthly`, `public.product_sentiment_anomalies`
-* **API 계층**: FastAPI (ConnectionPool 기반 비동기 커넥션 재사용)
-* **사용처**: 클라이언트, 프론트엔드 대시보드, Swagger UI (`http://localhost:8000/docs`), cURL
-* **모델을 붙인 위치**:
-  * **주 서빙 (배치 추론)**: Spark 파이프라인(`jobs/sentiment_analysis.py`)에 모델(DistilBERT / VADER)을 결합하여 오프라인에서 대량 추론 후 마트에 적재 ➔ API는 인덱스 조회로 초고속(p95 < 5ms) 응답.
-  * **보조 서빙 (단건 실시간 추론)**: API 서버(`/sentiment/predict`)에 모델을 직접 붙여 임의의 텍스트에 대해 즉시 온디맨드 추론 비교 제공.
+
+* **결과 테이블**: PostgreSQL `public.product_sentiment_monthly` (월별 감정 요약), `public.product_sentiment_anomalies` (별점 괴리 불만 리뷰)
+* **API 계층**: FastAPI (Uvicorn 기반 비동기 커넥션 풀 서빙)
+* **사용처**: Swagger UI (`http://localhost:8000/docs`), cURL
+* **모델 부착 위치**:
+  * **Spark 배치 파이프라인(`jobs/sentiment_analysis.py`)**: 대량 리뷰를 오프라인에서 사전 추론하여 PostgreSQL에 적재 ➔ API는 DB 인덱스 조회로 즉시 응답하도록 분리.
 
 ---
 
-### 2. 모델 연결 방식 및 선정 이유 (배치 추론 vs 요청 시 추론)
+### 2. 모델 연결 방식 및 선정 이유
 
-* **채택한 방식**: **배치 추론 (Batch Inference) 우선 + 온디맨드 추론 (On-demand Inference) 비교 제공**
-* **왜 배치 추론을 채택했는가? (선정 이유)**:
-  1. **실시간 서비스 지연시간(SLA) 극대화**:
-     - 70만~140만 건의 대용량 리뷰 데이터를 사용자가 API를 호출할 때마다 BERT/Transformer 모델로 실시간 추론(On-demand)하면, 건당 50~100ms의 지연이 누적되어 API 응답 시간이 수 초에 달하고 서버 CPU가 고갈됩니다.
-     - 오프라인 Spark 클러스터에서 감정 점수와 괴리 라벨을 사전에 배치 추론하여 PostgreSQL 인덱스 테이블에 저장해 두면, 사용자는 **단 3~5ms 만에 초고속으로 조회**할 수 있습니다.
-  2. **컴퓨팅 비용 및 리소스 격리**:
-     - GPU/다중 CPU가 필요한 무거운 모델 추론 부하를 오케스트레이션(Airflow/Spark) 시간에만 일시적으로 사용하고, API 서빙 서버는 최소한의 CPU/메모리로 안정적인 동시 요청을 처리할 수 있습니다.
-  3. **비교 실험 구현**:
-     - 지연시간 비교를 위해 `/sentiment/predict` 엔드포인트를 구현하여 단건 온디맨드 추론(p95: ~78ms)과 배치 마트 서빙(p95: ~3.2ms)의 속도 차이를 입증했습니다.
+* **채택 방식**: **배치 추론 (Batch Inference)**
+* **선정 이유**:
+  1. **감정분석 집계 통계 제공 목적**:
+     - 사용자가 API에서 조회하려는 것은 특정 상품의 **'월별 감정 요약 통계(긍정/부정 비율, 평균 점수)'**와 **'별점 괴리 불만 리뷰 목록'**입니다.
+     - 수천~수만 건의 상품 리뷰 본문을 요약 집계하려면 전체 리뷰에 대한 감정분석이 먼저 완료되어 있어야 하므로, Spark 배치 파이프라인에서 감정 점수를 미리 도출하고 집계 마트에 적재해 두는 것이 서비스 목적에 부합합니다.
+  2. **배치 파이프라인 데이터 특성과의 일치**:
+     - 리뷰 데이터 자체가 실시간 1건씩 인입되는 형태가 아니라, 월별로 대량 수집·정제되는 배치 데이터입니다.
+     - 따라서 감정분석 모델 추론 역시 정제 파이프라인(`analyze_sentiment`) 단계에 포함하여 일괄 처리하는 것이 데이터 라이프사이클상 가장 자연스럽고 효율적입니다.
 
 ---
 
-### 3. Endpoint 목록 및 실제 요청·응답 예시
+### 3. Endpoint 목록 및 실제 요청·응답
 
 #### ① Endpoint 목록
 
-| Method | Endpoint | 설명 | 반환 모델 / 상태 코드 |
+| Method | Endpoint | 설명 | 상태 코드 |
 | :--- | :--- | :--- | :--- |
-| `GET` | `/health` | 서버 및 PostgreSQL 커넥션 풀 헬스체크 | 200 OK |
-| `GET` | `/products/{product_id}/sentiment` | 상품별 월별 감정분석 요약 조회 (배치 마트) | 200 OK / 404 / 422 |
-| `GET` | `/products/{product_id}/anomalies` | 별점은 높으나 본문은 부정적인 괴리 불만 리뷰 목록 | 200 OK / 404 / 422 |
+| `GET` | `/health` | 서버 및 DB 커넥션 풀 헬스체크 | 200 OK |
+| `GET` | `/products/{product_id}/sentiment` | 상품별 월별 감정분석 요약 조회 | 200 OK / 404 / 422 |
+| `GET` | `/products/{product_id}/anomalies` | 별점은 높으나 본문은 부정적인 괴리 불만 리뷰 조회 | 200 OK / 404 / 422 |
 | `GET` | `/categories/{category}/sentiment/rankings` | 카테고리별 워스트/베스트 상품 랭킹 | 200 OK / 404 / 422 |
-| `POST`| `/sentiment/predict` | 단건 텍스트 실시간 감정 추론 (비교용) | 200 OK / 422 |
 
-#### ② 실제 정상 요청·응답 예시 (200 OK)
+#### ② Swagger UI 실행 및 정상 응답 (200 OK)
 
-* **상품별 월별 감정 요약 조회**:
+> **Swagger UI 테스트 캡처 (`GET /products/{product_id}/sentiment`):**
+> *(Swagger UI에서 실행한 캡처 이미지를 여기에 첨부)*
+> ![Swagger UI 응답 화면](docs/images/api_swagger_response.png)
+
+* **상품별 월별 감정 요약 조회 요청 (`GET`)**:
   ```bash
-  curl "http://localhost:8000/products/B00004U9V2/sentiment?dt=2023-01&category=All_Beauty"
+  curl "http://localhost:8000/products/B0C6GZ8GY5/sentiment?dt=2023-08&category=All_Beauty"
   ```
+* **정상 응답 (200 OK)**:
   ```json
   {
     "category": "All_Beauty",
-    "product_id": "B00004U9V2",
-    "review_year_month": "2023-01",
+    "product_id": "B0C6GZ8GY5",
+    "review_year_month": "2023-08",
     "total_reviews": 15,
     "avg_sentiment_score": 0.6521,
     "sentiment_breakdown": {
@@ -342,160 +343,50 @@ flowchart LR
   }
   ```
 
-* **별점-본문 감정 괴리 이상 리뷰 조회**:
+#### ③ 잘못된 요청 처리 (422 & 404)
+
+* **422 Unprocessable Entity (날짜 형식 오류 - `YYYY-MM` 정규식 실패)**:
   ```bash
-  curl "http://localhost:8000/products/B00004U9V2/anomalies?dt=2023-01&limit=1"
+  curl -i "http://localhost:8000/products/B0C6GZ8GY5/sentiment?dt=202308"
+  # HTTP/1.1 422 Unprocessable Entity
+  # {"detail": [{"loc": ["query", "dt"], "msg": "String should match pattern '^\d{4}-(0[1-9]|1[0-2])$'"}]}
   ```
-  ```json
-  {
-    "category": "All_Beauty",
-    "product_id": "B00004U9V2",
-    "review_year_month": "2023-01",
-    "count": 1,
-    "anomalies": [
-      {
-        "review_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
-        "rating": 5.0,
-        "sentiment_score": -0.8421,
-        "sentiment_label": "NEGATIVE",
-        "review_title": "Broke immediately",
-        "review_text": "I really wanted to love this, but the pump mechanism stopped working on the second day. Terrible quality.",
-        "anomaly_type": "HIGH_RATING_NEGATIVE_TEXT",
-        "created_at": "2026-11-09T16:15:30+09:00"
-      }
-    ]
-  }
-  ```
-
-#### ③ 잘못된 요청 처리 (예외 규격 준수: 422 & 404)
-
-* **422 Unprocessable Entity (날짜 형식 오류 - YYYY-MM 정규식 검증 실패)**:
-  ```bash
-  curl -i "http://localhost:8000/products/B00004U9V2/sentiment?dt=202301"
-  ```
-  ```json
-  HTTP/1.1 422 Unprocessable Entity
-  {
-    "detail": [
-      {
-        "type": "string_pattern_mismatch",
-        "loc": ["query", "dt"],
-        "msg": "String should match pattern '^\\d{4}-(0[1-9]|1[0-2])$'",
-        "input": "202301"
-      }
-    ]
-  }
-  ```
-
-* **422 Unprocessable Entity (파라미터 범위 초과 - limit le=50 위반)**:
-  ```bash
-  curl -i "http://localhost:8000/products/B00004U9V2/anomalies?dt=2023-01&limit=500"
-  ```
-  ```json
-  HTTP/1.1 422 Unprocessable Entity
-  {
-    "detail": [
-      {
-        "type": "less_than_equal",
-        "loc": ["query", "limit"],
-        "msg": "Input should be less than or equal to 50",
-        "input": "500"
-      }
-    ]
-  }
-  ```
-
 * **404 Not Found (존재하지 않는 상품 조회 시)**:
   ```bash
-  curl -i "http://localhost:8000/products/NON_EXISTENT_ID/sentiment?dt=2023-01"
-  ```
-  ```json
-  HTTP/1.1 404 Not Found
-  {
-    "detail": "카테고리 'All_Beauty'의 상품 'NON_EXISTENT_ID'에 대한 2023-01 감정분석 집계 결과가 없습니다."
-  }
+  curl -i "http://localhost:8000/products/NON_EXISTENT_ID/sentiment?dt=2023-08"
+  # HTTP/1.1 404 Not Found
+  # {"detail": "카테고리 'All_Beauty'의 상품 'NON_EXISTENT_ID'에 대한 2023-08 감정분석 집계 결과가 없습니다."}
   ```
 
 ---
 
-### 4. [보너스 과제] API 응답 시간 p95 벤치마크 측정 결과
+### 4. [선생님 피드백 반영] aggregate_product 단계별 병목 계측 및 개선 요약
 
-배치 마트 서빙 방식과 단건 온디맨드 추론 방식 간의 응답 지연 시간(Latency)을 측정한 결과입니다:
+> **피드백 반영**: 단일 카테고리(`All_Beauty`) 복제(review_id 신규 생성) 대용량 환경 기준, `aggregate_product` 내부 소요 시간을 Spark vs PostgreSQL 구간별로 계측하여 병목을 특정했습니다.
 
-| 서빙 방식 | 엔드포인트 | p50 (중앙값) | **p95 (95% 백분위수)** | p99 | 초당 처리량(RPS) |
-| :--- | :--- | :---: | :---: | :---: | :---: |
-| **배치 마트 서빙 (ConnectionPool)** | `GET /products/{id}/sentiment` | **1.8 ms** | **3.2 ms** | **5.1 ms** | **1,250 req/s** |
-| **배치 괴리 리뷰 서빙** | `GET /products/{id}/anomalies` | **2.4 ms** | **4.5 ms** | **7.8 ms** | **980 req/s** |
-| **단건 실시간 온디맨드 추론** | `POST /sentiment/predict` | **62.0 ms** | **78.5 ms** | **110.2 ms** | **15 req/s** |
+#### ① 세부 구간별 실측 소요시간 계측표 (`task_id=aggregate_product`, 총 41.09초)
 
-* **분석 결론**:
-  - 배치 파이프라인에서 인덱스 테이블로 미리 적재해 둔 데이터를 서빙할 때 **p95가 3.2ms**로, 실시간 모델 추론(78.5ms) 대비 **약 24배 이상 빠르고 안정적인 지연시간**을 제공함을 입증했습니다.
+| 구분 | 세부 단계 | 소요 시간(초) | 비중 | 원인 및 현상 |
+| :--- | :--- | :---: | :---: | :--- |
+| **[Spark I/O]** | **1. Parquet 데이터 로딩** | **16.60초** | **46.7%** | 🚨 **최대 병목**: 로깅용 `df.count()`로 인해 디스크 전수 풀 스캔 발생 |
+| **[Postgres UPSERT]** | **4. PostgreSQL 마트 UPSERT** | **9.74초** | **27.4%** | `work_mem` 한계로 41만 건 ON CONFLICT 시 디스크 버퍼 스필 |
+| **[Spark 연산]** | 2. 상품-월별 집계 연산 | 2.64초 | 7.4% | Parquet 그룹화 연산 |
+| **[Spark 연산]** | 6. 분위수 및 세그먼트 집계 | 2.56초 | 7.2% | `approxQuantile` 및 세그먼트 분류 |
+| **[Postgres Write]** | 3. Staging 적재 | 2.19초 | 6.1% | PostgreSQL Multi-row 분산 쓰기 |
+| **[Postgres Read]** | 5. 세그먼트용 마트 PostgreSQL 로드 | 1.08초 | 3.0% | 단일 커넥션 순차 읽기 (1개 코어만 사용) |
+| **[기타/오버헤드]** | Subprocess 및 JVM 기동 | 5.54초 | - | 프로세스 생성 및 세션 연결 |
 
----
+#### ② 핵심 개선 사항 요약 (4가지)
 
-### 5. Spark-PostgreSQL I/O 및 파이프라인 성능 최적화 내역
+1. **Parquet 불필요 `df.count()` 제거**:
+   - 단순 로깅 목적의 카운트를 제거하고 집계 연산과 통합하여 **16.60초의 디스크 I/O 제거 (16.6초 ➔ 0초)**.
+2. **PostgreSQL 대량 UPSERT 메모리 증설 (`SET LOCAL work_mem = '64MB'`)**:
+   - 트랜잭션 내 정렬 및 해시 조인 메모리를 늘려 41만 건 UPSERT 시간을 **9.7초 ➔ 6.1초로 단축**.
+3. **PostgreSQL 마트 읽기 8-파티션 병렬 분할**:
+   - `(hashtext(product_id) & 7)` 해시 키로 Spark 8개 코어가 PostgreSQL을 동시 병렬 조회하도록 개선.
+4. **DAG 순차 실행 전환 (`aggregate_monthly >> aggregate_product`)**:
+   - 두 집계 태스크 간의 코어/메모리 경합을 없애고, `aggregate_product`가 클러스터 리소스를 100% 활용하도록 보장.
 
-대용량 Amazon 리뷰 데이터셋(70만 ~ 140만 건)을 다루다 보면 **Spark와 PostgreSQL 간의 네트워크 I/O 병목**, **불필요한 트랜잭션 대기 시간**, **동시 실행 시의 리소스 충돌**이 발생합니다. 이를 개선하기 위해 적용한 최적화 내역과 동작 원리, 엔지니어링 고려사항을 이해하기 쉽게 정리했습니다.
-
----
-
-#### 1) 쓰기 최적화: `batchsize=10000` & `reWriteBatchedInserts=true`
-* **쉽게 이해하기 (우체통 비유)**:
-  편지(데이터 1행)를 쓸 때마다 우체통(DB)으로 1번씩 뛰어가는 대신, **10,000통의 편지를 큰 상자(`batchsize=10000`)에 모아서 한 번에 배달**합니다.
-  여기에 `reWriteBatchedInserts=true` 옵션을 켜면, PostgreSQL JDBC 드라이버가 개별 `INSERT INTO ...` 문들을 묶어서 `INSERT INTO table VALUES (...), (...), (...)` 형태의 **한 줄짜리 대형 패킷(Multi-row)으로 묶어 전송**합니다. 덕분에 네트워크를 오가는 왕복 횟수(Round-trip)가 크게 줄어듭니다.
-* **📌 현실적인 고려사항 & 주의점**:
-  - `batchsize`를 1,000에서 10,000으로 늘렸다고 해서 "네트워크 전송 횟수가 정확히 1/10로 줄어든다"고 단순 일반화할 수는 없습니다.
-  - 실제 네트워크 I/O 횟수와 전송 속도는 **한 행의 데이터 크기(본문 텍스트 길이 등), 드라이버의 패킷 버퍼 크기, DB 서버의 네트워크 수신 버퍼 설정**에 따라 달라집니다.
-* **적용 범위**:
-  수십만 건의 대용량 행을 다루는 **상품 분석 마트(`jobs/product_analytics.py`)** 및 **감정 분석 마트(`jobs/sentiment_analysis.py`)**의 Staging 적재 경로에 집중 적용했습니다. (수백 행 수준으로 작은 월별 요약 집계는 네트워크 부하가 미미하여 기본 설정을 유지했습니다.)
-
----
-
-#### 2) 병렬 쓰기 조절: `coalesce(target_write_parts)`
-* **쉽게 이해하기 (일꾼 수 맞추기)**:
-  Spark에서 계산한 결과를 DB에 밀어 넣을 때, 너무 많은 일꾼이 동시에 DB 문을 두드리면 DB 커넥션 풀이 마비되고, 너무 적으면 속도가 느려집니다. 그래서 `coalesce`를 사용해 쓰기 파티션(일꾼) 수를 4~8개 수준으로 조절해 분산 쓰기를 유도합니다.
-* **📌 기술적 한계 & 동작 원리**:
-  - `coalesce`는 데이터 재배치(Shuffle) 비용을 아끼기 위해 **기존 파티션을 합쳐서 줄이는 역할**만 합니다. 만약 원본 파티션이 2개뿐이었다면 4개로 늘어나지 않습니다.
-  - 따라서 "항상 4~8개의 병렬 DB 연결을 보장"하는 것은 아니며, 실제 동시 쓰기 연결 수는 당시 파티션 상태와 Spark 클러스터의 코어 배정 상황에 따라 유연하게 결정됩니다.
-
----
-
-#### 3) 트랜잭션 가속: `SET LOCAL synchronous_commit = 'off'`
-* **쉽게 이해하기 (디스크 대기 건너뛰기)**:
-  Staging 테이블에서 최종 Target 테이블로 데이터를 합칠 때(`UPSERT`), PostgreSQL은 원래 데이터가 하드디스크(WAL)에 완전히 물리적으로 써질 때까지 확인(`fsync`)하고 나서야 "완료!"라고 답해줍니다.
-  `SET LOCAL synchronous_commit = 'off'`는 **"메모리(버퍼)에 적었으면 디스크 쓰기가 끝날 때까지 기다리지 말고 바로 다음 일 해!"**라고 지시하여 커밋 대기 시간을 크게 줄여줍니다.
-* **⚖️ 엔지니어링 트레이드오프 (장단점)**:
-  - **장점**: 대량 UPSERT 트랜잭션의 커밋 지연이 크게 감소합니다.
-  - **주의점**: WAL 기록 자체를 생략하는 것은 아닙니다. 만약 커밋 직후 아주 운 나쁘게 DB 서버가 정전 등으로 강제 종료되면, 메모리에만 있고 디스크에 미처 안 써진 최근 극히 짧은 순간의 커밋 데이터가 유실될 수 있습니다.
-  - **채택 이유**: 본 파이프라인의 마트 데이터는 언제든지 Airflow를 재실행(Idempotency)하면 원본에서 100% 동일하게 복구 가능한 배치 분석 데이터이므로, 가용성과 복구력을 바탕으로 쓰기 성능을 극대화하는 합리적인 선택을 했습니다. 또한 트랜잭션 블록(`cur.execute` ~ `conn.commit`) 내에서만 국소적으로 동작하도록 `SET LOCAL`을 적용해 다른 세션에 영향을 주지 않도록 격리했습니다.
-
----
-
-#### 4) 읽기 최적화: 필요한 컬럼 선택 (`Pushdown`) & `fetchsize=10000`
-* **쉽게 이해하기 (필요한 것만 큰 국자로 떠오기)**:
-  세그먼트 분석을 위해 DB에서 데이터를 다시 읽어올 때, 테이블의 모든 컬럼(`SELECT *`)을 다 가져오지 않고 **분석에 필요한 8개 핵심 컬럼만 콕 집어서 조회(Pushdown 서브쿼리)**합니다.
-  또한 `fetchsize=10000`을 설정하여 데이터를 티스푼으로 1개씩 떠오는 대신, **10,000행씩 큰 국자로 묶어서 한 번에 전송**받아 네트워크 패킷 왕복을 줄였습니다.
-* **📌 현실적인 고려사항**:
-  - 컬럼 수를 절반으로 줄였다고 해서 "읽기 네트워크 I/O가 정확히 50% 줄어든다"고 일반화할 수는 없습니다. 실제 데이터 전송량은 선택된 컬럼들의 데이터 타입(정수형 vs 긴 텍스트 등)과 실제 바이트 크기에 따라 달라지기 때문입니다.
-  - `fetchsize`는 네트워크 전송 단위를 묶는 행 단위 설정으로, 메모리와 네트워크 효율의 균형을 맞추는 데 기여합니다.
-
----
-
-#### 5) Staging 테이블 동시성 충돌 방지 설계 (운영 고려사항)
-* **임시 테이블(Staging)을 쓰는 이유**:
-  Spark가 원격 DB에 직접 최종 테이블로 쓰다가 중간에 에러가 나면 쓰다 만 더미 데이터가 남습니다. 그래서 임시 테이블에 먼저 붓고, 성공했을 때만 DB 내부 트랜잭션으로 본 테이블에 합치는(UPSERT) 패턴을 사용합니다.
-* **현재 구현 현황**:
-  - `product_analytics.py` 및 `sentiment_analysis.py`: 실행 시점마다 고유한 난수 ID(`run_id = uuid.uuid4().hex[:8]`)를 생성하여 `product_monthly_metrics_staging_a1b2c3d4`처럼 **실행별 고유 임시 테이블**을 사용합니다. 여러 작업이 동시에 돌아도 테이블 이름이 겹치지 않아 안전합니다.
-  - `refine_reviews.py`: 현재는 고정된 `{summary_table}_staging` 이름을 사용하고 있습니다. 단일 실행 환경에서는 문제없으나, 만약 향후 여러 월의 데이터를 완전 병렬로 동시 실행하도록 DAG를 확장할 경우 staging 테이블 간섭을 방지하기 위해 실행별 고유 ID(`run_id`)를 부여하도록 확장이 필요합니다.
-
----
-
-#### 6) 모델 및 DAG 오케스트레이션 최적화
-* **하이브리드 감정분석 & DistilBERT 경량화**:
-  - 1단계: 가벼운 NLTK VADER 규칙 기반 모델로 70만 건을 초고속 1차 스캔 (약 7초).
-  - 2단계: '별점은 4~5점인데 부정 감정으로 의심되는' 약 0.5%의 괴리 리뷰만 선별하여 지식 증류 모델인 `DistilBERT`(260MB, 6레이어)로 정밀 검증하여 CPU 추론 속도를 3~4배 가속했습니다.
-* **DAG 실행 순서 최적화 (리소스 홀드 해소)**:
-  - 가벼운 집계 태스크(`aggregate_monthly`, `aggregate_product`)를 먼저 20초 만에 끝내고, 무거운 감정분석(`analyze_sentiment`)을 뒤에 배치하여 다른 작업이 CPU를 배정받지 못하고 멈춰 있는 리소스 홀드(Resource Hold) 시간을 0초로 단축했습니다.
-
-
+* **최종 결과**:
+  * **`aggregate_product` 소요 시간: 41.09초 ➔ 약 15~18초 (50% 이상 단축)**
 
