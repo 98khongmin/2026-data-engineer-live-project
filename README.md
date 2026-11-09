@@ -360,7 +360,7 @@ flowchart LR
 
 ---
 
-### 4. [선생님 피드백 반영] aggregate_product 단계별 병목 계측 및 개선 요약
+### 4.aggregate_product 단계별 병목 계측 및 개선 요약
 
 > **피드백 반영**: 단일 카테고리(`All_Beauty`) 복제(review_id 신규 생성) 대용량 환경 기준, `aggregate_product` 내부 소요 시간을 Spark vs PostgreSQL 구간별로 계측하여 병목을 특정했습니다.
 
