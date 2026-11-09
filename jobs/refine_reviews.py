@@ -41,6 +41,58 @@ def make_review_id(user_id, parent_asin, timestamp):
     return str(uuid.uuid5(NAMESPACE_URL, key))
 
 
+def send_slack_alert(job_name, error_message, category=None, year_month=None, step=None):
+    """Spark 작업/워커 실패 시 Slack Webhook으로 장애 알림을 전송합니다."""
+    webhook_url = os.getenv("SLACK_WEBHOOK_URL")
+    if not webhook_url:
+        return
+
+    try:
+        import json
+        import urllib.request
+
+        err_str = str(error_message)
+        if len(err_str) > 800:
+            err_str = err_str[:800] + "\n... (생략)"
+
+        fields = [
+            {"title": "Spark Job", "value": f"`{job_name}`", "short": True},
+            {"title": "실행 단계 (Step)", "value": f"`{step or 'all'}`", "short": True},
+        ]
+        if category:
+            fields.append({"title": "카테고리", "value": f"`{category}`", "short": True})
+        if year_month:
+            fields.append({"title": "대상 년월", "value": f"`{year_month}`", "short": True})
+
+        fields.append({"title": "오류/장애 상세 내용", "value": f"```{err_str}```", "short": False})
+
+        payload = {
+            "text": f"🚨 [Spark 장애 알림] {job_name} 작업 실패 감지",
+            "attachments": [
+                {
+                    "color": "#E01E5A",
+                    "title": f"🚨 Spark 작업/워커 장애 감지: {job_name}",
+                    "fields": fields,
+                    "mrkdwn_in": ["text", "fields"],
+                }
+            ],
+        }
+
+        req = urllib.request.Request(
+            webhook_url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as response:
+            if response.status == 200:
+                print(f"[Slack 알림 전송 완료] Spark 장애 알림이 성공적으로 전송되었습니다.", flush=True)
+            else:
+                print(f"[Slack 알림 응답 경고] HTTP {response.status}", flush=True)
+    except Exception as notify_err:
+        print(f"[Slack 알림 전송 실패] 알림 전송 중 오류: {notify_err}", flush=True)
+
+
 def write_atomic_file(target_path, content=""):
     """임시 파일에 작성 후 fsync를 거쳐 os.replace로 원자적으로 교체합니다."""
     dir_name = os.path.dirname(target_path)
@@ -833,6 +885,16 @@ def main():
                 monthly_summary.orderBy(F.col("review_year_month").desc()).show(10, truncate=False)
                 print("=" * 70, flush=True)
 
+    except Exception as e:
+        print(f"[Spark 작업 실패 감지] 오류 발생: {e}", flush=True)
+        send_slack_alert(
+            job_name=f"AmazonReview_RefineReviews_{category}",
+            error_message=e,
+            category=category,
+            year_month=args.year_month,
+            step=args.step,
+        )
+        raise e
     finally:
         if all_run_lock is not None and all_run_lock_acquired:
             all_run_lock.__exit__(None, None, None)

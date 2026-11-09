@@ -8,8 +8,8 @@ x-airflow-common:
     &airflow-common-env
     AIRFLOW__CORE__EXECUTOR: CeleryExecutor
     AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
-    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://postgres:postgres@postgres:5432/postgres
-    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql+psycopg2://postgres:postgres@postgres:5432/postgres
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://postgres:postgres@postgres:5432/airflow
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql+psycopg2://postgres:postgres@postgres:5432/airflow
     AIRFLOW__CELERY__BROKER_URL: redis://:@redis:6379/0
     AIRFLOW__CORE__FERNET_KEY: 'us62Iyn_eVDHei9-uhpLn8Yon2JiiGcPBQyPq-Nc6Ps='
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'false'
@@ -41,9 +41,14 @@ x-airflow-common:
     DEFAULT_CATEGORY: All_Beauty
     PROCESSED_DIR: /opt/airflow/data/processed/All_Beauty
 
+    # 실패 알림용 Slack Webhook URL
+    SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
+
     # 경량 패키지 설치
-    _PIP_ADDITIONAL_REQUIREMENTS: --no-deps apache-airflow-providers-apache-spark>=6.3.0 psycopg2-binary requests boto3
+    _PIP_ADDITIONAL_REQUIREMENTS: --no-deps apache-airflow-providers-apache-spark>=6.3.0 psycopg2-binary requests boto3 nltk
     AIRFLOW_CONFIG: '/opt/airflow/config/airflow.cfg'
+    NLTK_DATA: /opt/nltk_data
+    HF_HOME: /opt/hf_cache
   volumes:
     - ./dags:/opt/airflow/dags
     - ./jobs:/opt/airflow/jobs
@@ -97,12 +102,18 @@ services:
     restart: always
 
   spark-master:
-    image: apache/spark:4.2.0
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: amazon-review-spark:latest
     container_name: spark-master
     ports:
       - "8081:8080"   # Airflow UI(8080)와 포트 충돌 방지
       - "7077:7077"
       - "4040:4040"
+    environment:
+      - NLTK_DATA=/opt/nltk_data
+      - HF_HOME=/opt/hf_cache
     command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
     volumes:
       - spark-java-bin:/opt/java/openjdk
@@ -117,16 +128,20 @@ services:
     restart: always
 
   spark-worker-1:
-    image: apache/spark:4.2.0
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: amazon-review-spark:latest
     container_name: spark-worker-1
     user: root
     depends_on:
       - spark-master
     environment:
       - SPARK_WORKER_MEMORY=2g
-      - SPARK_WORKER_CORES=2
-    command: >
-      bash -c "pip install pyarrow && /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077"
+      - SPARK_WORKER_CORES=4
+      - NLTK_DATA=/opt/nltk_data
+      - HF_HOME=/opt/hf_cache
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
     volumes:
       - ./jobs:/opt/spark/app
       - ./jobs:/opt/airflow/jobs
@@ -137,16 +152,20 @@ services:
     restart: always
 
   spark-worker-2:
-    image: apache/spark:4.2.0
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: amazon-review-spark:latest
     container_name: spark-worker-2
     user: root
     depends_on:
       - spark-master
     environment:
       - SPARK_WORKER_MEMORY=2g
-      - SPARK_WORKER_CORES=2
-    command: >
-      bash -c "pip install pyarrow && /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077"
+      - SPARK_WORKER_CORES=4
+      - NLTK_DATA=/opt/nltk_data
+      - HF_HOME=/opt/hf_cache
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
     volumes:
       - ./jobs:/opt/spark/app
       - ./jobs:/opt/airflow/jobs

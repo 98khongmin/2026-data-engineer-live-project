@@ -1,7 +1,7 @@
 """5회차 과제: Airflow DAG 설계 및 구현 - Amazon 리뷰 월별 요약 및 상품별 분석 마트 파이프라인.
 
-DAG 구조 (병렬 집계 분기 및 수렴):
-    download_raw_data >> prepare_raw_parquet >> refine_store_parquet >> [aggregate_monthly, aggregate_product] >> validate_data
+DAG 구조 (순차 집계 및 리소스 최적화):
+    download_raw_data >> prepare_raw_parquet >> refine_store_parquet >> [aggregate_monthly, aggregate_product] >> analyze_sentiment >> validate_data
 
 스케줄 & 증분 처리 (사전 감지 스킵 탑재):
     - 매월 1일 (schedule="@monthly") - 논리적 날짜(data_interval_start) 기준 전월 1달 치 데이터 처리
@@ -20,12 +20,66 @@ from airflow.operators.python import PythonOperator
 
 
 def notify_failure(context):
-    """태스크 실패 시 호출되는 알림 콜백 (현재는 콘솔 [ALERT] 로그로 기록되며, 향후 웹훅 연동 지점)."""
+    """태스크 실패 시 호출되는 알림 콜백 (로컬 콘솔 [ALERT] 로그 및 Slack Webhook 알림)."""
     task_instance = context.get("task_instance")
     task_id = task_instance.task_id if task_instance else "unknown_task"
-    execution_date = context.get("execution_date")
+    dag = context.get("dag")
+    dag_id = task_instance.dag_id if task_instance else (dag.dag_id if dag else "unknown_dag")
+    execution_date = context.get("execution_date") or context.get("logical_date")
     exception = context.get("exception")
-    print(f"[ALERT] Task '{task_id}' 실패 감지! 실행일자: {execution_date}, 오류 내용: {exception}")
+    params = context.get("params", {})
+    category = params.get("category", "All_Beauty")
+    year_month = params.get("year_month", "auto")
+    sentiment_model = params.get("sentiment_model", "hybrid")
+
+    alert_msg = f"[ALERT] Task '{task_id}' 실패 감지! 실행일자: {execution_date}, 오류 내용: {exception}"
+    print(alert_msg, flush=True)
+
+    webhook_url = os.getenv("SLACK_WEBHOOK_URL")
+    if not webhook_url:
+        return
+
+    try:
+        import json
+        import urllib.request
+
+        err_text = str(exception) if exception else "원인 미상 (로그 확인 필요)"
+        if len(err_text) > 800:
+            err_text = err_text[:800] + "\n... (생략)"
+
+        payload = {
+            "text": f"🚨 [Airflow 태스크 실패 알림] {task_id} (DAG: {dag_id})",
+            "attachments": [
+                {
+                    "color": "#E01E5A",
+                    "title": f"🚨 Airflow 태스크 실패: {task_id}",
+                    "fields": [
+                        {"title": "DAG", "value": f"`{dag_id}`", "short": True},
+                        {"title": "Task", "value": f"`{task_id}`", "short": True},
+                        {"title": "카테고리", "value": f"`{category}`", "short": True},
+                        {"title": "대상 년월", "value": f"`{year_month}`", "short": True},
+                        {"title": "감정분석 모델", "value": f"`{sentiment_model}`", "short": True},
+                        {"title": "실행 시각", "value": str(execution_date), "short": False},
+                        {"title": "오류 내용", "value": f"```{err_text}```", "short": False},
+                    ],
+                    "mrkdwn_in": ["text", "fields"],
+                }
+            ],
+        }
+
+        req = urllib.request.Request(
+            webhook_url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as response:
+            if response.status == 200:
+                print(f"[Slack 알림 전송 완료] Task '{task_id}' 실패 알림이 성공적으로 전송되었습니다.", flush=True)
+            else:
+                print(f"[Slack 알림 응답 경고] HTTP {response.status}", flush=True)
+    except Exception as e:
+        print(f"[Slack 알림 전송 실패] 슬랙 전송 중 오류 발생: {e}", flush=True)
 
 
 def validate_postgres_summary(**context):
@@ -136,6 +190,21 @@ def validate_postgres_summary(**context):
                 print(f"[세그먼트 비교 마트 검증] ({category}) 등록된 세그먼트 수: {len(segments)}개 (기준값 및 산출기간 보존 확인)")
                 for seg in segments:
                     print(f"  - [{seg[3]}] 상품 수: {seg[4]:,}개, 누적 리뷰: {seg[5]:,}건 (규칙: {seg[0]}, 기간: {seg[1]}~{seg[2]})")
+
+            # 6. 감정분석 마트 및 이상 리뷰 검증
+            cur.execute("""
+                SELECT count(*), coalesce(min(avg_sentiment_score), 0), coalesce(max(avg_sentiment_score), 0),
+                       coalesce(sum(mismatch_reviews), 0)
+                FROM public.product_sentiment_monthly
+                WHERE category = %s;
+            """, (category,))
+            sent_row = cur.fetchone()
+            if sent_row and sent_row[0] > 0:
+                sent_cnt, min_s, max_s, total_mismatch = sent_row
+                print(
+                    f"[감정분석 마트 품질 검증] ({category}) 상품-월별 감정 레코드 수: {sent_cnt:,}건 "
+                    f"(점수 범위: {min_s:.2f} ~ {max_s:.2f}, 누적 별점 괴리 불만 리뷰: {total_mismatch:,}건)"
+                )
     finally:
         conn.close()
 
@@ -187,6 +256,14 @@ with DAG(
             description=(
                 "다운로드할 원본 파일의 URL. 비어있을 경우 로컬 data/raw/{category}.jsonl 파일을 사용하며, "
                 "로컬에도 파일이 없으면 파이프라인이 즉시 중단됩니다. '{category}'는 선택된 카테고리명으로 자동 치환됩니다."
+            ),
+        ),
+        "sentiment_model": Param(
+            default="hybrid",
+            type="string",
+            enum=["hybrid", "nltk", "transformer"],
+            description=(
+                "감정분석 모델 선택 (hybrid: 1차 VADER 초고속 + 2차 DistilBERT 정밀검증[추천] / nltk: VADER 룰 기반 초고속 CPU 분석 / transformer: 전체 DistilBERT 경량 감정분석)"
             ),
         ),
     },
@@ -323,6 +400,7 @@ with DAG(
             {% set ym = '2023-01' %}
         {% endif %}
         echo "[Airflow 실행 날짜 정보] logical_date={{ logical_date }}, target_ym={{ ym }}, category={{ cat }}"
+        mkdir -p /tmp/.ivy_aggregate_monthly
         /opt/spark/bin/spark-submit \
             --master spark://spark-master:7077 \
             --deploy-mode client \
@@ -332,6 +410,7 @@ with DAG(
             --conf spark.driver.host=airflow-worker \
             --conf spark.driver.bindAddress=0.0.0.0 \
             --conf spark.ui.showConsoleProgress=false \
+            --conf spark.jars.ivy=/tmp/.ivy_aggregate_monthly \
             --packages org.postgresql:postgresql:42.7.4 \
             /opt/airflow/jobs/refine_reviews.py \
             --step aggregate_monthly \
@@ -365,6 +444,7 @@ with DAG(
             {% set ym = '2023-01' %}
         {% endif %}
         echo "[Airflow 실행 날짜 정보] logical_date={{ logical_date }}, target_ym={{ ym }}, category={{ cat }}"
+        mkdir -p /tmp/.ivy_aggregate_product
         /opt/spark/bin/spark-submit \
             --master spark://spark-master:7077 \
             --deploy-mode client \
@@ -374,6 +454,7 @@ with DAG(
             --conf spark.driver.host=airflow-worker \
             --conf spark.driver.bindAddress=0.0.0.0 \
             --conf spark.ui.showConsoleProgress=false \
+            --conf spark.jars.ivy=/tmp/.ivy_aggregate_product \
             --packages org.postgresql:postgresql:42.7.4 \
             /opt/airflow/jobs/product_analytics.py \
             --step all \
@@ -393,6 +474,52 @@ with DAG(
         """,
     )
 
+    # 5-2. 상품별 월별 감정분석 및 괴리 리뷰 마트 적재 (NLTK 기본 / GPU 트랜스포머 지원)
+    analyze_sentiment = BashOperator(
+        task_id="analyze_sentiment",
+        bash_command="""
+        {% set cat = params.category if (params.category and params.category != '') else 'All_Beauty' %}
+        {% set model = params.sentiment_model if (params.sentiment_model and params.sentiment_model != '') else 'hybrid' %}
+        {% if params.year_month and params.year_month not in ('auto', '') %}
+            {% set ym = params.year_month %}
+        {% elif data_interval_start %}
+            {% set ym = data_interval_start.strftime('%Y-%m') %}
+        {% elif logical_date %}
+            {% set ym = logical_date.strftime('%Y-%m') %}
+        {% else %}
+            {% set ym = '2023-01' %}
+        {% endif %}
+        echo "[Airflow 감정분석] logical_date={{ logical_date }}, target_ym={{ ym }}, category={{ cat }}, model={{ model }}"
+        mkdir -p /tmp/.ivy_analyze_sentiment
+        /opt/spark/bin/spark-submit \
+            --master spark://spark-master:7077 \
+            --deploy-mode client \
+            --executor-memory 1600m \
+            --driver-memory 1600m \
+            --conf spark.sql.shuffle.partitions=32 \
+            --conf spark.driver.host=airflow-worker \
+            --conf spark.driver.bindAddress=0.0.0.0 \
+            --conf spark.ui.showConsoleProgress=false \
+            --conf spark.jars.ivy=/tmp/.ivy_analyze_sentiment \
+            --packages org.postgresql:postgresql:42.7.4 \
+            /opt/airflow/jobs/sentiment_analysis.py \
+            --year-month "{{ ym }}" \
+            --category "{{ cat }}" \
+            --partitions 32 \
+            --processed-dir /opt/airflow/data/processed/{{ cat }} \
+            --sentiment-table public.product_sentiment_monthly \
+            --anomaly-table public.product_sentiment_anomalies \
+            --model-type "{{ model }}"
+        """,
+        retries=2,
+        retry_delay=timedelta(minutes=3),
+        doc_md="""
+        ### analyze_sentiment
+        * **역할**: 정제된 Parquet 파티션에서 리뷰 텍스트 감정 분석(NLTK VADER 기본, GPU 트랜스포머 2순위)을 수행하여 상품별 월별 감정 집계(`product_sentiment_monthly`) 및 별점 괴리 불만 리뷰(`product_sentiment_anomalies`)를 PostgreSQL에 UPSERT 적재
+        * **재시도 전략**: 2회 재시도 (3분 간격)
+        """,
+    )
+
     # 6. 데이터 품질 및 멱등성 검증 (데이터 정합성 이슈 -> 재시도 없이 즉시 알림)
     validate_data = PythonOperator(
         task_id="validate_data",
@@ -400,11 +527,13 @@ with DAG(
         retries=0,
         doc_md="""
         ### validate_data
-        * **역할**: PostgreSQL `monthly_review_summary`, `product_monthly_metrics`, 뷰 및 세그먼트 마트 데이터 정합성 검증
+        * **역할**: PostgreSQL `monthly_review_summary`, `product_monthly_metrics`, 뷰, 세그먼트 및 감정분석 마트 데이터 정합성 검증
         * **재시도 전략**: 재시도 0회. 품질 검증 실패는 비즈니스/데이터 결함이므로 즉시 알림 발송 후 파이프라인 차단
         """,
     )
 
-    # Task 실행 순서 및 의존성 정의 (정제 Parquet 완료 후 월별 요약과 상품별 마트를 병렬 실행 후 품질 검증으로 수렴)
-    download_raw_data >> prepare_raw_parquet >> refine_store_parquet >> [aggregate_monthly, aggregate_product] >> validate_data
+    # Task 실행 순서 및 의존성 정의:
+    # 20초 만에 끝나는 가벼운 집계(월별 요약, 상품별 마트)를 먼저 8코어 풀가동으로 완료하여 리소스 홀드를 방지한 뒤,
+    # 감정분석 마트를 실행하고 최종 품질 검증으로 수렴합니다.
+    download_raw_data >> prepare_raw_parquet >> refine_store_parquet >> [aggregate_monthly, aggregate_product] >> analyze_sentiment >> validate_data
 

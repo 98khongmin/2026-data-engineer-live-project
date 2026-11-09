@@ -1,2 +1,14 @@
 psycopg2-binary==2.9.11
 tqdm==4.67.1
+pandas>=2.0.0
+pyarrow>=14.0.0
+nltk>=3.8.1
+torch>=2.0.0
+transformers>=4.36.0
+fastapi>=0.110.0
+uvicorn>=0.28.0
+psycopg[binary]>=3.1.18
+psycopg_pool>=3.2.1
+
+
+
