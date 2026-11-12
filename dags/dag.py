@@ -10,8 +10,8 @@ DAG 구조 (순차 집계 및 리소스 최적화):
     - 이미 대상 월의 Parquet 파티션이 존재하는 경우 정제를 자동으로 스킵하여 백필 속도 극대화
     - 정제 Parquet 완료 후 aggregate_monthly(월별 요약)와 aggregate_product(상품별 마트)를 병렬 분기 실행하여 총 수행시간 단축
 """
-from datetime import datetime, timedelta
 import os
+from datetime import datetime, timedelta
 
 from airflow import DAG
 from airflow.models.param import Param
@@ -26,10 +26,19 @@ def notify_failure(context):
     dag = context.get("dag")
     dag_id = task_instance.dag_id if task_instance else (dag.dag_id if dag else "unknown_dag")
     execution_date = context.get("execution_date") or context.get("logical_date")
+    logical_date = context.get("logical_date") or context.get("data_interval_start") or context.get("execution_date")
     exception = context.get("exception")
     params = context.get("params", {})
     category = params.get("category", "All_Beauty")
-    year_month = params.get("year_month", "auto")
+    if logical_date and hasattr(logical_date, "year"):
+        if logical_date.year >= 2024:
+            year_month = "all"
+        else:
+            year_month = logical_date.strftime("%Y-%m")
+    elif params.get("year_month"):
+        year_month = params.get("year_month")
+    else:
+        year_month = "all"
     sentiment_model = params.get("sentiment_model", "hybrid")
 
     alert_msg = f"[ALERT] Task '{task_id}' 실패 감지! 실행일자: {execution_date}, 오류 내용: {exception}"
@@ -86,21 +95,25 @@ def validate_postgres_summary(**context):
     """PostgreSQL monthly_review_summary 및 product_monthly_metrics 데이터 품질 및 멱등성 검증."""
     params = context.get("params", {})
     category = params.get("category") or os.getenv("DEFAULT_CATEGORY", "All_Beauty")
-    target_ym = params.get("year_month")
-    if not target_ym or target_ym.lower() in ("auto", ""):
-        data_interval_start = context.get("data_interval_start")
-        if data_interval_start:
-            target_ym = data_interval_start.strftime("%Y-%m")
-        else:
-            logical_date = context.get("logical_date")
-            target_ym = logical_date.strftime("%Y-%m") if logical_date else None
+    logical_date = context.get("logical_date") or context.get("data_interval_start") or context.get("execution_date")
 
-    logical_date = context.get("logical_date")
+    # 논리적 날짜 기준: 2024년 이상이면 'all', 2000~2023년이면 해당 월(YYYY-MM) 핀포인트
+    if logical_date and hasattr(logical_date, "year"):
+        if logical_date.year >= 2024:
+            target_ym = "all"
+        else:
+            target_ym = logical_date.strftime("%Y-%m")
+    elif params.get("year_month"):
+        target_ym = params.get("year_month")
+    else:
+        target_ym = "all"
+
     data_interval_start = context.get("data_interval_start")
     data_interval_end = context.get("data_interval_end")
     print(
         f"[Airflow 실행 날짜 정보] logical_date={logical_date}, "
-        f"data_interval_start={data_interval_start}, target_ym={target_ym}, category={category}"
+        f"data_interval_start={data_interval_start}, data_interval_end={data_interval_end}, "
+        f"target_ym={target_ym}, category={category}"
     )
 
     import psycopg2
@@ -226,19 +239,11 @@ with DAG(
     default_args=default_args,
     description="월별 Amazon 리뷰 다운로드, Spark 정제(Parquet), 월별 요약 및 상품별 분석 마트(PostgreSQL UPSERT), 품질 검증 파이프라인",
     schedule="@monthly",  # 매월 1일 정기 자동 실행
-    start_date=datetime(2000, 1, 1),  # 원본 데이터셋 시작 연도(2000년)부터 백필/수동 트리거 지원
-    end_date=datetime(2023, 10, 1),  # 데이터셋 최종 월(2023-09) 마감 시점 (현재 시점 불필요한 자동 스케줄 방지)
+    # start_date=datetime(2000, 1, 1),  # 원본 데이터셋 시작 연도(2000년)부터 백필/수동 트리거 지원
+    # end_date=datetime(2023, 10, 1),  # 데이터셋 최종 월(2023-09) 마감 시점 (현재 시점 불필요한 자동 스케줄 방지)
     catchup=False,
     max_active_runs=1,
     params={
-        "year_month": Param(
-            default="auto",
-            type="string",
-            description=(
-                "처리할 대상 년월 (YYYY-MM). 'auto'는 선택한 논리적 날짜/백필 구간의 월을 자동 처리합니다. "
-                "특정 월 강제 지정 시 '2023-01' 또는 전체 실행 시 'all'을 입력하세요."
-            ),
-        ),
         "category": Param(
             default=os.getenv("DEFAULT_CATEGORY", "All_Beauty"),
             type="string",
@@ -348,14 +353,13 @@ with DAG(
         task_id="refine_store_parquet",
         bash_command="""
         {% set cat = params.category if (params.category and params.category != '') else 'All_Beauty' %}
-        {% if params.year_month and params.year_month not in ('auto', '') %}
-            {% set ym = params.year_month %}
-        {% elif data_interval_start %}
-            {% set ym = data_interval_start.strftime('%Y-%m') %}
-        {% elif logical_date %}
-            {% set ym = logical_date.strftime('%Y-%m') %}
+        {% set run_date = logical_date if (logical_date is defined and logical_date) else (data_interval_start if (data_interval_start is defined and data_interval_start) else None) %}
+        {% if run_date and run_date.strftime('%Y')|int >= 2024 %}
+            {% set ym = 'all' %}
+        {% elif run_date and run_date.strftime('%Y')|int <= 2023 %}
+            {% set ym = run_date.strftime('%Y-%m') %}
         {% else %}
-            {% set ym = '2023-01' %}
+            {% set ym = 'all' %}
         {% endif %}
         echo "[Airflow 실행 날짜 정보] logical_date={{ logical_date }}, target_ym={{ ym }}, category={{ cat }}"
         /opt/spark/bin/spark-submit \
@@ -390,14 +394,13 @@ with DAG(
         task_id="aggregate_monthly",
         bash_command="""
         {% set cat = params.category if (params.category and params.category != '') else 'All_Beauty' %}
-        {% if params.year_month and params.year_month not in ('auto', '') %}
-            {% set ym = params.year_month %}
-        {% elif data_interval_start %}
-            {% set ym = data_interval_start.strftime('%Y-%m') %}
-        {% elif logical_date %}
-            {% set ym = logical_date.strftime('%Y-%m') %}
+        {% set run_date = logical_date if (logical_date is defined and logical_date) else (data_interval_start if (data_interval_start is defined and data_interval_start) else None) %}
+        {% if run_date and run_date.strftime('%Y')|int >= 2024 %}
+            {% set ym = 'all' %}
+        {% elif run_date and run_date.strftime('%Y')|int <= 2023 %}
+            {% set ym = run_date.strftime('%Y-%m') %}
         {% else %}
-            {% set ym = '2023-01' %}
+            {% set ym = 'all' %}
         {% endif %}
         echo "[Airflow 실행 날짜 정보] logical_date={{ logical_date }}, target_ym={{ ym }}, category={{ cat }}"
         mkdir -p /tmp/.ivy_aggregate_monthly
@@ -434,14 +437,13 @@ with DAG(
         task_id="aggregate_product",
         bash_command="""
         {% set cat = params.category if (params.category and params.category != '') else 'All_Beauty' %}
-        {% if params.year_month and params.year_month not in ('auto', '') %}
-            {% set ym = params.year_month %}
-        {% elif data_interval_start %}
-            {% set ym = data_interval_start.strftime('%Y-%m') %}
-        {% elif logical_date %}
-            {% set ym = logical_date.strftime('%Y-%m') %}
+        {% set run_date = logical_date if (logical_date is defined and logical_date) else (data_interval_start if (data_interval_start is defined and data_interval_start) else None) %}
+        {% if run_date and run_date.strftime('%Y')|int >= 2024 %}
+            {% set ym = 'all' %}
+        {% elif run_date and run_date.strftime('%Y')|int <= 2023 %}
+            {% set ym = run_date.strftime('%Y-%m') %}
         {% else %}
-            {% set ym = '2023-01' %}
+            {% set ym = 'all' %}
         {% endif %}
         echo "[Airflow 실행 날짜 정보] logical_date={{ logical_date }}, target_ym={{ ym }}, category={{ cat }}"
         mkdir -p /tmp/.ivy_aggregate_product
@@ -480,14 +482,13 @@ with DAG(
         bash_command="""
         {% set cat = params.category if (params.category and params.category != '') else 'All_Beauty' %}
         {% set model = params.sentiment_model if (params.sentiment_model and params.sentiment_model != '') else 'hybrid' %}
-        {% if params.year_month and params.year_month not in ('auto', '') %}
-            {% set ym = params.year_month %}
-        {% elif data_interval_start %}
-            {% set ym = data_interval_start.strftime('%Y-%m') %}
-        {% elif logical_date %}
-            {% set ym = logical_date.strftime('%Y-%m') %}
+        {% set run_date = logical_date if (logical_date is defined and logical_date) else (data_interval_start if (data_interval_start is defined and data_interval_start) else None) %}
+        {% if run_date and run_date.strftime('%Y')|int >= 2024 %}
+            {% set ym = 'all' %}
+        {% elif run_date and run_date.strftime('%Y')|int <= 2023 %}
+            {% set ym = run_date.strftime('%Y-%m') %}
         {% else %}
-            {% set ym = '2023-01' %}
+            {% set ym = 'all' %}
         {% endif %}
         echo "[Airflow 감정분석] logical_date={{ logical_date }}, target_ym={{ ym }}, category={{ cat }}, model={{ model }}"
         mkdir -p /tmp/.ivy_analyze_sentiment

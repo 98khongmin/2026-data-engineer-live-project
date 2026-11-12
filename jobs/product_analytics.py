@@ -321,6 +321,48 @@ def ensure_database_objects(db_config):
         print(f"[DB 초기화 경고] DDL 실행 중 오류 발생 (이미 생성된 경우 무시 가능): {e}", flush=True)
 
 
+def drop_table_if_exists(db_config, table_name):
+    """PostgreSQL 테이블이 존재할 경우 안전하게 삭제합니다."""
+    try:
+        conn = psycopg2.connect(**db_config)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"DROP TABLE IF EXISTS {table_name};")
+            conn.commit()
+            print(f"[Staging 정리] 임시 테이블 삭제 완료: {table_name}", flush=True)
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[Staging 정리 경고] {table_name} 삭제 중 오류 (무시됨): {e}", flush=True)
+
+
+def cleanup_stale_staging_tables(db_config, prefixes=("product_monthly_metrics_staging_", "product_segment_comparison_staging_")):
+    """이전 비정상 종료로 남겨진 stale staging 테이블들을 일괄 정리합니다."""
+    try:
+        conn = psycopg2.connect(**db_config)
+        try:
+            with conn.cursor() as cur:
+                for prefix in prefixes:
+                    cur.execute(
+                        """
+                        SELECT table_schema, table_name
+                        FROM information_schema.tables
+                        WHERE table_name LIKE %s;
+                        """,
+                        (f"{prefix}%",),
+                    )
+                    stale_tables = cur.fetchall()
+                    for schema, tbl in stale_tables:
+                        full_name = f'"{schema}"."{tbl}"' if schema else tbl
+                        cur.execute(f"DROP TABLE IF EXISTS {full_name};")
+                        print(f"[시작 정리] 이전 실패 잔여 staging 테이블 삭제: {full_name}", flush=True)
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[Staging 시작 정리 경고] 잔여 staging 테이블 조회/삭제 중 오류: {e}", flush=True)
+
+
 def upsert_staging_to_metrics(db_config, staging_table, target_table):
     """PostgreSQL staging 테이블의 상품 월별 지표를 target 마트 테이블에 원자적 UPSERT 병합합니다."""
     upsert_sql = f"""
@@ -467,29 +509,34 @@ def run_aggregate_metrics(spark, args, db_config, profiler=None):
     run_id = uuid.uuid4().hex[:8]
     staging_table = f"product_monthly_metrics_staging_{run_id}"
 
-    with measure_ctx("3. PostgreSQL JDBC Staging 적재", component="POSTGRES_WRITE") as m:
-        m["count"] = metrics_count
-        print(f"[상품 마트 DB 적재] PostgreSQL 임시 테이블({staging_table})에 분산 적재 중 (batchsize=10000, Multi-row rewrite)...", flush=True)
-        target_write_parts = min(max(4, metrics_df.rdd.getNumPartitions()), 8)
-        (
-            metrics_df.coalesce(target_write_parts)
-            .write
-            .format("jdbc")
-            .option("url", jdbc_url)
-            .option("dbtable", staging_table)
-            .option("user", db_config["user"])
-            .option("password", db_config["password"])
-            .option("driver", "org.postgresql.Driver")
-            .option("batchsize", "10000")
-            .mode("overwrite")
-            .save()
-        )
+    try:
+        with measure_ctx("3. PostgreSQL JDBC Staging 적재", component="POSTGRES_WRITE") as m:
+            m["count"] = metrics_count
+            print(f"[상품 마트 DB 적재] PostgreSQL 임시 테이블({staging_table})에 분산 적재 중 (batchsize=10000, Multi-row rewrite)...", flush=True)
+            target_write_parts = min(max(4, metrics_df.rdd.getNumPartitions()), 8)
+            (
+                metrics_df.coalesce(target_write_parts)
+                .write
+                .format("jdbc")
+                .option("url", jdbc_url)
+                .option("dbtable", staging_table)
+                .option("user", db_config["user"])
+                .option("password", db_config["password"])
+                .option("driver", "org.postgresql.Driver")
+                .option("batchsize", "10000")
+                .mode("overwrite")
+                .save()
+            )
 
-    metrics_df.unpersist()
-
-    with measure_ctx("4. PostgreSQL 마트 UPSERT 병합", component="POSTGRES_UPSERT") as m:
-        m["count"] = metrics_count
-        upsert_staging_to_metrics(db_config, staging_table, args.metrics_table)
+        with measure_ctx("4. PostgreSQL 마트 UPSERT 병합", component="POSTGRES_UPSERT") as m:
+            m["count"] = metrics_count
+            upsert_staging_to_metrics(db_config, staging_table, args.metrics_table)
+    finally:
+        try:
+            metrics_df.unpersist()
+        except Exception:
+            pass
+        drop_table_if_exists(db_config, staging_table)
 
 
 def run_analyze_segments(spark, args, db_config, profiler=None):
@@ -609,25 +656,36 @@ def run_analyze_segments(spark, args, db_config, profiler=None):
     run_id = uuid.uuid4().hex[:8]
     staging_table = f"product_segment_comparison_staging_{run_id}"
 
-    with measure_ctx("7. 세그먼트 Staging 및 UPSERT", component="POSTGRES_WRITE") as m:
-        m["count"] = seg_count
-        (
-            segment_summary.write
-            .format("jdbc")
-            .option("url", jdbc_url)
-            .option("dbtable", staging_table)
-            .option("user", db_config["user"])
-            .option("password", db_config["password"])
-            .option("driver", "org.postgresql.Driver")
-            .option("batchsize", "10000")
-            .mode("overwrite")
-            .save()
-        )
-        upsert_staging_to_segments(db_config, staging_table, args.segment_table)
-
-    segment_summary.unpersist()
-    prod_totals.unpersist()
-    metrics_df.unpersist()
+    try:
+        with measure_ctx("7. 세그먼트 Staging 및 UPSERT", component="POSTGRES_WRITE") as m:
+            m["count"] = seg_count
+            (
+                segment_summary.write
+                .format("jdbc")
+                .option("url", jdbc_url)
+                .option("dbtable", staging_table)
+                .option("user", db_config["user"])
+                .option("password", db_config["password"])
+                .option("driver", "org.postgresql.Driver")
+                .option("batchsize", "10000")
+                .mode("overwrite")
+                .save()
+            )
+            upsert_staging_to_segments(db_config, staging_table, args.segment_table)
+    finally:
+        try:
+            segment_summary.unpersist()
+        except Exception:
+            pass
+        try:
+            prod_totals.unpersist()
+        except Exception:
+            pass
+        try:
+            metrics_df.unpersist()
+        except Exception:
+            pass
+        drop_table_if_exists(db_config, staging_table)
 
 
 def main():
@@ -663,6 +721,7 @@ def main():
 
     db_config = get_db_config()
     ensure_database_objects(db_config)
+    cleanup_stale_staging_tables(db_config)
 
     spark = (
         SparkSession.builder

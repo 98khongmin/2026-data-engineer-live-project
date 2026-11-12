@@ -129,6 +129,8 @@ def ensure_database_objects(db_config, sentiment_table, anomaly_table):
         ON {sentiment_table}(category, review_year_month);
     CREATE INDEX IF NOT EXISTS idx_prod_sent_cat_prod
         ON {sentiment_table}(category, product_id);
+    CREATE INDEX IF NOT EXISTS idx_prod_sent_ranking
+        ON {sentiment_table}(category, review_year_month, avg_sentiment_score);
 
     CREATE TABLE IF NOT EXISTS {anomaly_table} (
         category VARCHAR(100) NOT NULL,
@@ -147,6 +149,8 @@ def ensure_database_objects(db_config, sentiment_table, anomaly_table):
 
     CREATE INDEX IF NOT EXISTS idx_sent_anom_cat_prod_ym
         ON {anomaly_table}(category, product_id, review_year_month);
+    CREATE INDEX IF NOT EXISTS idx_sent_anom_cat_prod_ym_score
+        ON {anomaly_table}(category, product_id, review_year_month, sentiment_score ASC);
     """
     if psycopg2 is None:
         print("[DB 초기화 경고] psycopg2가 설치되어 있지 않아 DDL 사전 생성을 건너뜁니다.", flush=True)
@@ -161,6 +165,52 @@ def ensure_database_objects(db_config, sentiment_table, anomaly_table):
         print(f"[DB 초기화] 감정 분석 테이블({sentiment_table}, {anomaly_table}) 스키마 확인 완료.", flush=True)
     except Exception as e:
         print(f"[DB 초기화 경고] DDL 실행 중 오류 (이미 존재할 시 무시 가능): {e}", flush=True)
+
+
+def drop_table_if_exists(db_config, table_name):
+    """PostgreSQL 테이블이 존재할 경우 안전하게 삭제합니다."""
+    if psycopg2 is None:
+        return
+    try:
+        conn = psycopg2.connect(**db_config)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"DROP TABLE IF EXISTS {table_name};")
+            conn.commit()
+            print(f"[Staging 정리] 임시 테이블 삭제 완료: {table_name}", flush=True)
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[Staging 정리 경고] {table_name} 삭제 중 오류 (무시됨): {e}", flush=True)
+
+
+def cleanup_stale_staging_tables(db_config, prefixes=("product_sentiment_monthly_staging_", "product_sentiment_anomalies_staging_")):
+    """이전 비정상 종료로 남겨진 stale staging 테이블들을 일괄 정리합니다."""
+    if psycopg2 is None:
+        return
+    try:
+        conn = psycopg2.connect(**db_config)
+        try:
+            with conn.cursor() as cur:
+                for prefix in prefixes:
+                    cur.execute(
+                        """
+                        SELECT table_schema, table_name
+                        FROM information_schema.tables
+                        WHERE table_name LIKE %s;
+                        """,
+                        (f"{prefix}%",),
+                    )
+                    stale_tables = cur.fetchall()
+                    for schema, tbl in stale_tables:
+                        full_name = f'"{schema}"."{tbl}"' if schema else tbl
+                        cur.execute(f"DROP TABLE IF EXISTS {full_name};")
+                        print(f"[시작 정리] 이전 실패 잔여 staging 테이블 삭제: {full_name}", flush=True)
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[Staging 시작 정리 경고] 잔여 staging 테이블 조회/삭제 중 오류: {e}", flush=True)
 
 
 def upsert_staging_to_metrics(db_config, staging_table, target_table):
@@ -308,6 +358,9 @@ def _get_transformer_analyzer():
         import torch
         from transformers import pipeline
 
+        # [최적화 1] 워커 프로세스당 OpenMP 스레드 폭발 방지 (CPU 1스레드 고정)
+        torch.set_num_threads(1)
+
         device = -1
         if torch.cuda.is_available():
             device = 0
@@ -320,50 +373,53 @@ def _get_transformer_analyzer():
             model=model_name,
             device=device,
             truncation=True,
-            max_length=512,
+            max_length=128,
         )
 
         def transformer_score_fn(text: str):
             cleaned = (text or "").strip()
             if not cleaned:
                 return 0.0, "NEUTRAL"
-            try:
-                # nlptown 모델 1~5 stars 다분류 모델은 top_k=None으로 전체 확률을 얻어 기대 별점(Expected Star) 산출
-                res = pipe(cleaned[:512], top_k=None)
-                if isinstance(res, list) and len(res) > 0 and isinstance(res[0], list):
-                    res = res[0]
-                has_stars = any("label" in item and item["label"][0].isdigit() for item in res)
-                if has_stars:
-                    expected_star = sum(
-                        int(item["label"][0]) * float(item["score"])
-                        for item in res
-                        if "label" in item and item["label"][0].isdigit()
-                    )
-                    # 1~5점 별점을 -1.0 ~ +1.0 감정 점수로 선형 정규화
-                    signed_score = (expected_star - 3.0) / 2.0
-                else:
-                    top_item = max(res, key=lambda x: float(x.get("score", 0.0)))
-                    lbl = str(top_item.get("label", "")).upper()
-                    sc = float(top_item.get("score", 1.0))
-                    signed_score = sc if "POS" in lbl else -sc
-            except Exception:
-                res = pipe(cleaned[:512])[0]
-                lbl = str(res.get("label", ""))
-                if lbl and lbl[0].isdigit():
-                    star = int(lbl[0])
-                    signed_score = (star - 3.0) / 2.0
-                elif "POS" in lbl.upper():
-                    signed_score = float(res.get("score", 1.0))
-                elif "NEG" in lbl.upper():
-                    signed_score = -float(res.get("score", 1.0))
-                else:
-                    signed_score = 0.0
+            # [최적화 2] autograd 연산 그래프 축적 차단 + 토크나이저 입력 앞 256자 절삭
+            with torch.inference_mode():
+                truncated_text = cleaned[:256]
+                try:
+                    # nlptown 모델 1~5 stars 다분류 모델은 top_k=None으로 전체 확률을 얻어 기대 별점(Expected Star) 산출
+                    res = pipe(truncated_text, top_k=None)
+                    if isinstance(res, list) and len(res) > 0 and isinstance(res[0], list):
+                        res = res[0]
+                    has_stars = any("label" in item and item["label"][0].isdigit() for item in res)
+                    if has_stars:
+                        expected_star = sum(
+                            int(item["label"][0]) * float(item["score"])
+                            for item in res
+                            if "label" in item and item["label"][0].isdigit()
+                        )
+                        # 1~5점 별점을 -1.0 ~ +1.0 감정 점수로 선형 정규화
+                        signed_score = (expected_star - 3.0) / 2.0
+                    else:
+                        top_item = max(res, key=lambda x: float(x.get("score", 0.0)))
+                        lbl = str(top_item.get("label", "")).upper()
+                        sc = float(top_item.get("score", 1.0))
+                        signed_score = sc if "POS" in lbl else -sc
+                except Exception:
+                    res = pipe(truncated_text)[0]
+                    lbl = str(res.get("label", ""))
+                    if lbl and lbl[0].isdigit():
+                        star = int(lbl[0])
+                        signed_score = (star - 3.0) / 2.0
+                    elif "POS" in lbl.upper():
+                        signed_score = float(res.get("score", 1.0))
+                    elif "NEG" in lbl.upper():
+                        signed_score = -float(res.get("score", 1.0))
+                    else:
+                        signed_score = 0.0
 
             assigned_lbl = "POSITIVE" if signed_score >= 0.1 else ("NEGATIVE" if signed_score <= -0.1 else "NEUTRAL")
             return round(float(signed_score), 4), assigned_lbl
 
         _GLOBAL_TRANSFORMER_ANALYZER = (transformer_score_fn, "transformer")
-        print(f"[Worker Transformer 활성화 완료] {model_name} 탑재 (Device: {device})", flush=True)
+        print(f"[Worker Transformer 활성화 완료] {model_name} 탑재 (Device: {device}, max_length: 128, threads: 1)", flush=True)
         return _GLOBAL_TRANSFORMER_ANALYZER
     except Exception as e:
         print(f"[Worker Transformer 로드 실패] 사유: {e} -> VADER로 Fallback", flush=True)
@@ -440,6 +496,20 @@ def run_sentiment_analysis(spark, args, db_config):
           .withColumn("text_for_sentiment", combined_text)
           .withColumn("title_for_sentiment", cleaned_title)
     )
+
+    # [컬럼 다이어트 1] 분석 및 적재에 필수적인 컬럼만 선별하여 불필요한 원본 메타데이터 필드 배제
+    keep_cols = [
+        col_name for col_name in [
+            "product_id",
+            "review_id",
+            "review_year_month",
+            "rating",
+            "title_for_sentiment",
+            "cleaned_review_text",
+            "text_for_sentiment",
+        ] if col_name in df.columns
+    ]
+    df = df.select(*keep_cols)
 
     # [최적화 1] 싱글 파일 로딩으로 인한 단일 코어 병목 방지:
     # 전체 워커 코어가 100% 동시에 가동되도록 파티션을 분할합니다.
@@ -537,22 +607,49 @@ def run_sentiment_analysis(spark, args, db_config):
                 .withColumn("model_name", F.lit("hybrid-transformer"))
                 .drop("tf_struct")
             )
+            # [최적화 & 진행률 로깅] 2단계 Transformer 결과를 디스크에 캐싱하며 1,000건마다 진행률 실시간 출력
+            refined_df = refined_df.persist(StorageLevel.DISK_ONLY)
+            tf_processed = 0
+            for _ in refined_df.select("review_id").toLocalIterator():
+                tf_processed += 1
+                if tf_processed % 1000 == 0 or tf_processed == suspicious_count:
+                    pct = (tf_processed / suspicious_count) * 100
+                    print(
+                        f"[하이브리드 2단계 진행] Transformer(BERT) 추론: "
+                        f"{tf_processed:,} / {suspicious_count:,}건 ({pct:.1f}%) 완료",
+                        flush=True,
+                    )
 
             scored_df = normal_df.unionByName(refined_df)
         else:
             print("[하이브리드 알림] 괴리 의심 리뷰가 없어 2단계를 건너뜁니다.", flush=True)
             scored_df = normal_df
 
-    # [최적화 2] UDF 연산 결과 캐싱:
-    # 이후 metrics_df와 anomalies_df의 count(), write() 실행 시 무거운 감정분석이 3~4회 중복 반복되지 않도록 방지
-    scored_df = scored_df.persist(StorageLevel.MEMORY_AND_DISK)
+    # [최적화 2] Spark 캐시 레벨 및 컬럼 다이어트:
+    # 1) UDF 추론 완료 후 불필요한 결합 텍스트 컬럼(text_for_sentiment) 즉시 제거
+    if "text_for_sentiment" in scored_df.columns:
+        scored_df = scored_df.drop("text_for_sentiment")
+
+    # 2) 780MB에 불과한 Spark JVM BlockManager 메모리 대신 디스크(DISK_ONLY)로 오프로드하여
+    #    대량 리뷰 처리 시 발생하는 java.lang.OutOfMemoryError: Java heap space 원천 차단
+    scored_df = scored_df.persist(StorageLevel.DISK_ONLY)
 
     # --------------------------------------------------------------------------
     # 1. 상품별-월별 감정 요약 집계 마트 산출
     # --------------------------------------------------------------------------
     print(f"[감정분석 집계] 상품별(product_id) x 월별(review_year_month) 감정 지표 산출 중...", flush=True)
+    # [컬럼 다이어트 2] 집계에 불필요한 본문 텍스트(cleaned_review_text, title_for_sentiment)를
+    # 셔플 이전에 제외하여 셔플 메모리 및 네트워크 전송량을 대폭 절감
+    metrics_input_df = scored_df.select(
+        "product_id",
+        "review_year_month",
+        "rating",
+        "sentiment_score",
+        "sentiment_label",
+        "model_name",
+    )
     metrics_df = (
-        scored_df.groupBy("product_id", "review_year_month")
+        metrics_input_df.groupBy("product_id", "review_year_month")
         .agg(
             F.count("*").cast("int").alias("total_reviews"),
             F.round(F.avg("sentiment_score"), 4).alias("avg_sentiment_score"),
@@ -568,9 +665,16 @@ def run_sentiment_analysis(spark, args, db_config):
         .withColumn("category", F.lit(category))
         .withColumn("updated_at", F.current_timestamp())
     )
+    metrics_df = metrics_df.persist(StorageLevel.DISK_ONLY)
 
-    metrics_count = metrics_df.count()
-    print(f"[감정분석 집계] 산출된 상품-월별 레코드 수: {metrics_count:,}건", flush=True)
+    # [진행률 로깅] 1,000건마다 Airflow 로그에 집계 진행 상황 출력
+    metrics_count = 0
+    for _ in metrics_df.select("product_id").toLocalIterator():
+        metrics_count += 1
+        if metrics_count % 1000 == 0:
+            print(f"[감정분석 집계 진행] 상품-월별 지표 산출: {metrics_count:,}건 집계 완료...", flush=True)
+
+    print(f"[감정분석 집계 완료] 최종 산출된 상품-월별 레코드 수: {metrics_count:,}건", flush=True)
 
     # --------------------------------------------------------------------------
     # 2. 별점-본문 감정 괴리(이상) 리뷰 데이터 추출
@@ -614,33 +718,15 @@ def run_sentiment_analysis(spark, args, db_config):
 
     # 3-1. 감정 요약 마트 적재
     staging_metrics_table = f"product_sentiment_monthly_staging_{run_id}"
-    print(f"[DB 적재] 요약 마트 임시 테이블({staging_metrics_table}) 저장 중 (batchsize=10000, Multi-row rewrite)...", flush=True)
-    target_write_parts = min(max(4, metrics_df.rdd.getNumPartitions()), 8)
-    (
-        metrics_df.coalesce(target_write_parts)
-        .write
-        .format("jdbc")
-        .option("url", jdbc_url)
-        .option("dbtable", staging_metrics_table)
-        .option("user", db_config["user"])
-        .option("password", db_config["password"])
-        .option("driver", "org.postgresql.Driver")
-        .option("batchsize", "10000")
-        .mode("overwrite")
-        .save()
-    )
-    upsert_staging_to_metrics(db_config, staging_metrics_table, args.sentiment_table)
-
-    # 3-2. 이상 리뷰 마트 적재 (건수가 있을 경우)
-    if anomalies_count > 0:
-        staging_anom_table = f"product_sentiment_anomalies_staging_{run_id}"
-        print(f"[DB 적재] 괴리 리뷰 임시 테이블({staging_anom_table}) 저장 중 (batchsize=10000)...", flush=True)
+    try:
+        print(f"[DB 적재] 요약 마트 임시 테이블({staging_metrics_table}) 저장 중 (batchsize=10000, Multi-row rewrite)...", flush=True)
+        target_write_parts = min(max(4, metrics_df.rdd.getNumPartitions()), 8)
         (
-            anomalies_df.coalesce(target_write_parts)
+            metrics_df.coalesce(target_write_parts)
             .write
             .format("jdbc")
             .option("url", jdbc_url)
-            .option("dbtable", staging_anom_table)
+            .option("dbtable", staging_metrics_table)
             .option("user", db_config["user"])
             .option("password", db_config["password"])
             .option("driver", "org.postgresql.Driver")
@@ -648,11 +734,39 @@ def run_sentiment_analysis(spark, args, db_config):
             .mode("overwrite")
             .save()
         )
-        upsert_staging_to_anomalies(db_config, staging_anom_table, args.anomaly_table)
+        upsert_staging_to_metrics(db_config, staging_metrics_table, args.sentiment_table)
+    finally:
+        drop_table_if_exists(db_config, staging_metrics_table)
 
-    # 캐시 메모리 해제
+    # 3-2. 이상 리뷰 마트 적재 (건수가 있을 경우)
+    if anomalies_count > 0:
+        staging_anom_table = f"product_sentiment_anomalies_staging_{run_id}"
+        try:
+            print(f"[DB 적재] 괴리 리뷰 임시 테이블({staging_anom_table}) 저장 중 (batchsize=10000)...", flush=True)
+            (
+                anomalies_df.coalesce(target_write_parts)
+                .write
+                .format("jdbc")
+                .option("url", jdbc_url)
+                .option("dbtable", staging_anom_table)
+                .option("user", db_config["user"])
+                .option("password", db_config["password"])
+                .option("driver", "org.postgresql.Driver")
+                .option("batchsize", "10000")
+                .mode("overwrite")
+                .save()
+            )
+            upsert_staging_to_anomalies(db_config, staging_anom_table, args.anomaly_table)
+        finally:
+            drop_table_if_exists(db_config, staging_anom_table)
+
+    # 캐시 메모리 및 디스크 임시 데이터 즉시 해제
     try:
-        scored_df.unpersist()
+        scored_df.unpersist(blocking=True)
+    except Exception:
+        pass
+    try:
+        metrics_df.unpersist(blocking=True)
     except Exception:
         pass
 
@@ -697,6 +811,7 @@ def main():
 
     try:
         ensure_database_objects(db_config, args.sentiment_table, args.anomaly_table)
+        cleanup_stale_staging_tables(db_config)
 
         spark = (
             SparkSession.builder

@@ -32,13 +32,40 @@ RAW_REVIEW_SCHEMA = T.StructType([
 ])
 
 
-@F.udf(returnType=T.StringType())
-def make_review_id(user_id, parent_asin, timestamp):
-    """user_id, parent_asin, timestamp를 결합해 고유한 UUID5 review_id를 생성합니다."""
-    if not user_id or not parent_asin or timestamp is None:
-        return None
-    key = json.dumps([user_id, parent_asin, timestamp], ensure_ascii=False, separators=(",", ":"))
-    return str(uuid.uuid5(NAMESPACE_URL, key))
+try:
+    import pandas as pd
+    from pyspark.sql.functions import pandas_udf
+
+    @pandas_udf(T.StringType())
+    def make_review_id(user_ids: pd.Series, parent_asins: pd.Series, timestamps: pd.Series) -> pd.Series:
+        """Arrow 기반 벡터 연산으로 user_id, parent_asin, timestamp를 결합해 동일한 UUID5 review_id를 일괄 생성합니다."""
+        ns = NAMESPACE_URL
+        dumps = json.dumps
+        u5 = uuid.uuid5
+        results = []
+        for u, p, t in zip(user_ids, parent_asins, timestamps):
+            if (
+                u
+                and p
+                and t is not None
+                and not pd.isna(u)
+                and not pd.isna(p)
+                and not pd.isna(t)
+            ):
+                key = dumps([str(u), str(p), int(t)], ensure_ascii=False, separators=(",", ":"))
+                results.append(str(u5(ns, key)))
+            else:
+                results.append(None)
+        return pd.Series(results)
+
+except ImportError:
+    @F.udf(returnType=T.StringType())
+    def make_review_id(user_id, parent_asin, timestamp):
+        """user_id, parent_asin, timestamp를 결합해 고유한 UUID5 review_id를 생성합니다 (Fallback)."""
+        if not user_id or not parent_asin or timestamp is None:
+            return None
+        key = json.dumps([user_id, parent_asin, timestamp], ensure_ascii=False, separators=(",", ":"))
+        return str(uuid.uuid5(NAMESPACE_URL, key))
 
 
 def send_slack_alert(job_name, error_message, category=None, year_month=None, step=None):
@@ -216,6 +243,82 @@ def cleanup_stale_all_staging(processed_dir):
             stale_path = os.path.join(parent_dir, entry)
             print(f"[시작 정리] 이전 실패 전체 staging 디렉터리 삭제: {stale_path}", flush=True)
             shutil.rmtree(stale_path, ignore_errors=True)
+
+
+def cleanup_stale_quarantine(processed_dir, target_ym=None):
+    """이전 실패로 남겨진 격리(quarantine) 디렉터리들을 정리합니다."""
+    if not os.path.exists(processed_dir):
+        return
+    if target_ym:
+        quarantine_prefix = f"._quarantine_review_year_month_{target_ym}_"
+        for d in os.listdir(processed_dir):
+            if d.startswith(quarantine_prefix):
+                stale_path = os.path.join(processed_dir, d)
+                print(f"[시작 정리] 이전 실패 잔여 quarantine 디렉토리 삭제: {stale_path}", flush=True)
+                shutil.rmtree(stale_path, ignore_errors=True)
+    else:
+        for d in os.listdir(processed_dir):
+            if d.startswith("._quarantine_"):
+                stale_path = os.path.join(processed_dir, d)
+                print(f"[시작 정리] 이전 실패 잔여 quarantine 디렉토리 삭제: {stale_path}", flush=True)
+                shutil.rmtree(stale_path, ignore_errors=True)
+
+
+def cleanup_stale_all_quarantine(processed_dir):
+    """전체 실행 실패로 남겨진 루트 quarantine 디렉터리를 정리합니다."""
+    parent_dir = os.path.dirname(processed_dir)
+    if not os.path.isdir(parent_dir or "."):
+        return
+    prefix = f"{os.path.basename(processed_dir)}._quarantine_all_"
+    for entry in os.listdir(parent_dir or "."):
+        if entry.startswith(prefix):
+            stale_path = os.path.join(parent_dir, entry)
+            print(f"[시작 정리] 이전 실패 전체 quarantine 디렉터리 삭제: {stale_path}", flush=True)
+            shutil.rmtree(stale_path, ignore_errors=True)
+
+
+def drop_table_if_exists(db_config, table_name):
+    """PostgreSQL 테이블이 존재할 경우 안전하게 삭제합니다."""
+    try:
+        import psycopg2
+        conn = psycopg2.connect(**db_config)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"DROP TABLE IF EXISTS {table_name};")
+            conn.commit()
+            print(f"[Staging 정리] 임시 테이블 삭제 완료: {table_name}", flush=True)
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[Staging 정리 경고] {table_name} 삭제 중 오류 (무시됨): {e}", flush=True)
+
+
+def cleanup_stale_staging_tables(db_config, prefixes=("monthly_review_summary_staging",)):
+    """이전 비정상 종료로 남겨진 stale staging 테이블들을 정리합니다."""
+    try:
+        import psycopg2
+        conn = psycopg2.connect(**db_config)
+        try:
+            with conn.cursor() as cur:
+                for prefix in prefixes:
+                    cur.execute(
+                        """
+                        SELECT table_schema, table_name
+                        FROM information_schema.tables
+                        WHERE table_name LIKE %s;
+                        """,
+                        (f"{prefix}%",),
+                    )
+                    stale_tables = cur.fetchall()
+                    for schema, tbl in stale_tables:
+                        full_name = f'"{schema}"."{tbl}"' if schema else tbl
+                        cur.execute(f"DROP TABLE IF EXISTS {full_name};")
+                        print(f"[시작 정리] 이전 실패 잔여 staging 테이블 삭제: {full_name}", flush=True)
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[Staging 시작 정리 경고] 잔여 staging 테이블 조회/삭제 중 오류: {e}", flush=True)
 
 
 def recover_all_state(processed_dir, run_id):
@@ -405,6 +508,7 @@ def main():
             with file_lock(lock_path):
                 run_id = uuid.uuid4().hex[:8]
                 cleanup_stale_all_staging(args.raw_parquet_dir)
+                cleanup_stale_all_quarantine(args.raw_parquet_dir)
                 target_ready = recover_all_state(args.raw_parquet_dir, run_id)
                 if target_ready or is_all_partitions_valid(args.raw_parquet_dir):
                     print("=" * 70, flush=True)
@@ -498,6 +602,8 @@ def main():
                 finally:
                     if os.path.exists(staging_raw):
                         shutil.rmtree(staging_raw, ignore_errors=True)
+                    if os.path.exists(quarantine_raw):
+                        shutil.rmtree(quarantine_raw, ignore_errors=True)
                 return
 
         # 1. 정제 및 Parquet 저장 단계
@@ -511,8 +617,9 @@ def main():
                 os.makedirs(args.processed_dir, exist_ok=True)
                 lock_path = os.path.join(args.processed_dir, f".lock_{target_ym}")
                 with file_lock(lock_path):
-                    # 시작 시 비정상 종료 상태 추론 복구 및 잔여 Staging 정리
+                    # 시작 시 비정상 종료 상태 추론 복구 및 잔여 Staging/Quarantine 정리
                     cleanup_stale_staging(args.processed_dir, target_ym)
+                    cleanup_stale_quarantine(args.processed_dir, target_ym)
                     target_ready = recover_partition_state(args.processed_dir, target_ym, run_id)
 
                     target_partition = os.path.join(args.processed_dir, f"review_year_month={target_ym}")
@@ -636,10 +743,13 @@ def main():
                         finally:
                             if os.path.exists(staging_root):
                                 shutil.rmtree(staging_root, ignore_errors=True)
+                            if os.path.exists(quarantine_dir):
+                                shutil.rmtree(quarantine_dir, ignore_errors=True)
             else:
                 # 전체(all) 실행 경로: 루트 단위 staging 발행 및 복구
                 os.makedirs(os.path.dirname(args.processed_dir) or ".", exist_ok=True)
                 cleanup_stale_all_staging(args.processed_dir)
+                cleanup_stale_all_quarantine(args.processed_dir)
                 target_ready = recover_all_state(args.processed_dir, run_id)
                 if target_ready or is_all_partitions_valid(args.processed_dir):
                     print("[정제 스킵] 루트 _SUCCESS 및 모든 월별 파티션 무결성 확인. 전체 정제를 생략합니다.", flush=True)
@@ -756,6 +866,8 @@ def main():
                     finally:
                         if os.path.exists(staging_dir):
                             shutil.rmtree(staging_dir, ignore_errors=True)
+                        if os.path.exists(quarantine_dir):
+                            shutil.rmtree(quarantine_dir, ignore_errors=True)
                 else:
                     if args.step in ("refine_store_parquet", "refine_parquet"):
                         print("[정제 단계] Parquet 파티션이 이미 준비되어 있으므로 작업을 성공적으로 마칩니다.", flush=True)
@@ -763,6 +875,7 @@ def main():
 
         # 2. 월별 집계 및 DB 적재 단계
         if args.step in ("all", "aggregate_monthly"):
+            cleanup_stale_staging_tables(database, prefixes=(f"{args.summary_table}_staging", "monthly_review_summary_staging"))
             if refined_df is None:
                 print("=" * 70, flush=True)
                 print(f"[집계 단계] {args.processed_dir} 정제 Parquet 데이터 로딩 중...", flush=True)
@@ -796,89 +909,92 @@ def main():
             else:
                 jdbc_url = f"jdbc:postgresql://{database['host']}:{database['port']}/{quote(database['dbname'], safe='')}"
                 staging_table = f"{args.summary_table}_staging"
-                print(f"[집계 단계] PostgreSQL 스테이징 테이블({staging_table})에 분산 적재 중...", flush=True)
-                (
-                    monthly_summary.write
-                    .format("jdbc")
-                    .option("url", jdbc_url)
-                    .option("dbtable", staging_table)
-                    .option("user", database["user"])
-                    .option("password", database["password"])
-                    .option("driver", "org.postgresql.Driver")
-                    .mode("overwrite")
-                    .save()
-                )
-
-                print(f"[집계 단계] PostgreSQL {args.summary_table} 대상 UPSERT(ON CONFLICT DO UPDATE) 병합 수행 중...", flush=True)
                 try:
-                    import psycopg2
-                    conn = psycopg2.connect(
-                        host=database["host"],
-                        port=database["port"],
-                        dbname=database["dbname"],
-                        user=database["user"],
-                        password=database["password"],
+                    print(f"[집계 단계] PostgreSQL 스테이징 테이블({staging_table})에 분산 적재 중...", flush=True)
+                    (
+                        monthly_summary.write
+                        .format("jdbc")
+                        .option("url", jdbc_url)
+                        .option("dbtable", staging_table)
+                        .option("user", database["user"])
+                        .option("password", database["password"])
+                        .option("driver", "org.postgresql.Driver")
+                        .mode("overwrite")
+                        .save()
                     )
+
+                    print(f"[집계 단계] PostgreSQL {args.summary_table} 대상 UPSERT(ON CONFLICT DO UPDATE) 병합 수행 중...", flush=True)
                     try:
-                        with conn.cursor() as cur:
-                            upsert_sql = f"""
-                                CREATE TABLE IF NOT EXISTS {args.summary_table} (
-                                    category VARCHAR(100) NOT NULL,
-                                    review_year_month VARCHAR(7) NOT NULL,
-                                    total_reviews BIGINT NOT NULL,
-                                    avg_rating DOUBLE PRECISION NOT NULL,
-                                    verified_reviews BIGINT NOT NULL,
-                                    unique_products BIGINT NOT NULL,
-                                    unique_users BIGINT NOT NULL,
-                                    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                                    PRIMARY KEY (category, review_year_month)
-                                );
-
-                                DO $$
-                                BEGIN
-                                    IF NOT EXISTS (
-                                        SELECT 1 FROM information_schema.columns
-                                        WHERE table_name = split_part('{args.summary_table}', '.', CASE WHEN '{args.summary_table}' LIKE '%.%' THEN 2 ELSE 1 END)
-                                          AND column_name = 'category'
-                                    ) THEN
-                                        ALTER TABLE {args.summary_table} ADD COLUMN IF NOT EXISTS category VARCHAR(100) DEFAULT '{category}' NOT NULL;
-                                        ALTER TABLE {args.summary_table} DROP CONSTRAINT IF EXISTS monthly_review_summary_pkey;
-                                        ALTER TABLE {args.summary_table} ADD PRIMARY KEY (category, review_year_month);
-                                    END IF;
-                                END $$;
-
-                                CREATE INDEX IF NOT EXISTS monthly_review_summary_cat_ym_idx
-                                    ON {args.summary_table}(category, review_year_month);
-
-                                INSERT INTO {args.summary_table} (
-                                    category, review_year_month, total_reviews, avg_rating,
-                                    verified_reviews, unique_products, unique_users, updated_at
-                                )
-                                SELECT
-                                    category, review_year_month, total_reviews, avg_rating,
-                                    verified_reviews, unique_products, unique_users, updated_at
-                                FROM {staging_table}
-                                ON CONFLICT (category, review_year_month) DO UPDATE SET
-                                    total_reviews = EXCLUDED.total_reviews,
-                                    avg_rating = EXCLUDED.avg_rating,
-                                    verified_reviews = EXCLUDED.verified_reviews,
-                                    unique_products = EXCLUDED.unique_products,
-                                    unique_users = EXCLUDED.unique_users,
-                                    updated_at = EXCLUDED.updated_at;
-
-                                DROP TABLE IF EXISTS {staging_table};
-                            """
-                            cur.execute(upsert_sql)
-                        conn.commit()
-                        print(
-                            f"[집계 단계 완료] PostgreSQL {args.summary_table} UPSERT 적재 완료 "
-                            f"(총 {monthly_count:,}행 멱등성 보장)",
-                            flush=True,
+                        import psycopg2
+                        conn = psycopg2.connect(
+                            host=database["host"],
+                            port=database["port"],
+                            dbname=database["dbname"],
+                            user=database["user"],
+                            password=database["password"],
                         )
-                    finally:
-                        conn.close()
-                except ImportError:
-                    print("[집계 단계 알림] psycopg2가 설치되지 않은 환경이라 스테이징 완료 후 직접 쿼리가 생략되었습니다.", flush=True)
+                        try:
+                            with conn.cursor() as cur:
+                                upsert_sql = f"""
+                                    CREATE TABLE IF NOT EXISTS {args.summary_table} (
+                                        category VARCHAR(100) NOT NULL,
+                                        review_year_month VARCHAR(7) NOT NULL,
+                                        total_reviews BIGINT NOT NULL,
+                                        avg_rating DOUBLE PRECISION NOT NULL,
+                                        verified_reviews BIGINT NOT NULL,
+                                        unique_products BIGINT NOT NULL,
+                                        unique_users BIGINT NOT NULL,
+                                        updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                                        PRIMARY KEY (category, review_year_month)
+                                    );
+
+                                    DO $$
+                                    BEGIN
+                                        IF NOT EXISTS (
+                                            SELECT 1 FROM information_schema.columns
+                                            WHERE table_name = split_part('{args.summary_table}', '.', CASE WHEN '{args.summary_table}' LIKE '%.%' THEN 2 ELSE 1 END)
+                                              AND column_name = 'category'
+                                        ) THEN
+                                            ALTER TABLE {args.summary_table} ADD COLUMN IF NOT EXISTS category VARCHAR(100) DEFAULT '{category}' NOT NULL;
+                                            ALTER TABLE {args.summary_table} DROP CONSTRAINT IF EXISTS monthly_review_summary_pkey;
+                                            ALTER TABLE {args.summary_table} ADD PRIMARY KEY (category, review_year_month);
+                                        END IF;
+                                    END $$;
+
+                                    CREATE INDEX IF NOT EXISTS monthly_review_summary_cat_ym_idx
+                                        ON {args.summary_table}(category, review_year_month);
+
+                                    INSERT INTO {args.summary_table} (
+                                        category, review_year_month, total_reviews, avg_rating,
+                                        verified_reviews, unique_products, unique_users, updated_at
+                                    )
+                                    SELECT
+                                        category, review_year_month, total_reviews, avg_rating,
+                                        verified_reviews, unique_products, unique_users, updated_at
+                                    FROM {staging_table}
+                                    ON CONFLICT (category, review_year_month) DO UPDATE SET
+                                        total_reviews = EXCLUDED.total_reviews,
+                                        avg_rating = EXCLUDED.avg_rating,
+                                        verified_reviews = EXCLUDED.verified_reviews,
+                                        unique_products = EXCLUDED.unique_products,
+                                        unique_users = EXCLUDED.unique_users,
+                                        updated_at = EXCLUDED.updated_at;
+
+                                    DROP TABLE IF EXISTS {staging_table};
+                                """
+                                cur.execute(upsert_sql)
+                            conn.commit()
+                            print(
+                                f"[집계 단계 완료] PostgreSQL {args.summary_table} UPSERT 적재 완료 "
+                                f"(총 {monthly_count:,}행 멱등성 보장)",
+                                flush=True,
+                            )
+                        finally:
+                            conn.close()
+                    except ImportError:
+                        print("[집계 단계 알림] psycopg2가 설치되지 않은 환경이라 스테이징 완료 후 직접 쿼리가 생략되었습니다.", flush=True)
+                finally:
+                    drop_table_if_exists(database, staging_table)
 
                 print("=" * 70, flush=True)
                 print("집계 결과:")
