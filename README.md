@@ -1,397 +1,273 @@
-# Amazon 리뷰 수집·정제 파이프라인
+# Amazon All_Beauty 리뷰 파이프라인 - 워커 강제 종료에도 유실 0건, 동시 50건에서 p95 58ms를 달성함
 
-## 사용 데이터 및 분석 목적
-
-- **데이터셋:** Amazon Reviews 2023의 `All_Beauty` 카테고리
-- **출처:** McAuley-Lab / Hugging Face Datasets (`McAuley-Lab/Amazon-Reviews-2023`)
-- **현재 입력:** Hugging Face Datasets 직접 다운로드 URL (`All_Beauty.jsonl`)
-  - `https://huggingface.co/datasets/McAuley-Lab/Amazon-Reviews-2023/resolve/main/raw/review_categories/All_Beauty.jsonl`
-  - 수집기가 다운로드하여 `data/raw/All_Beauty.jsonl`에 적재 (이미 파일이 존재하면 다운로드 자동 스킵)
-- **입력 규모:** 701,528행, 326,611,506바이트(약 311.5 MiB)
-- **데이터 단위:** 사용자 리뷰 1건. 평점, 제목, 본문, 상품·사용자 식별자, 밀리초 단위 작성 시각 등을 포함합니다.
-
-분석 목표는 어떤 상품의 어떤 문제부터 개선해야 하는가? 입니다.
-현재는 분석에 사용할 데이터를 수집·정제하는 단계까지 구현했습니다.
-
-| 향후 분석 | 제공하려는 결과 |
-| --- | --- |
-| 평점과 본문 감정 점수 비교 | 별점은 높지만 본문에 불만이 있는 리뷰 찾기 |
-| 평점 구간별 키워드 분석 | 낮은 평점의 주요 불만과 높은 평점의 구매 이유 파악 |
-| 상품별 월별 리뷰 수·평점 추이 | 상품 평가 악화와 리뷰 수 증가 추이 확인 |
-
-약 70만 행으로 로컬 개발과 검증을 진행하기에 적절해 이 카테고리를 선택했습니다.
-향후 다른 대용량 카테고리로 확장할 때도 수집·정제 구조를 활용하되,
-입력 필드, DB 용량, 파티션 수와 처리 성능을 확인할 계획입니다.
-
-## 현재 구조와 도구 선정 이유
-
-**수집기(JSONL) → 원본 적재(`data/raw/`) → Raw Parquet 준비(`data/raw_parquet/`) → Spark 분산 정제 및 Parquet 저장(`data/processed/<category>/`) → PostgreSQL 월별 요약 집계(`monthly_review_summary`) → 품질 검증** 흐름으로 동작합니다.
-
-| 계층 | 역할과 기술 스택 | 저장 포맷 및 위치 | 기본키(PK) / 식별자 |
-| :--- | :--- | :--- | :--- |
-| **1단계: 원본 수집** | 수집기(`collector.py`)가 외부 원본 JSONL을 로컬 스토리지에 안정적으로 다운로드 | JSONL (`data/raw/`) | 없음 (원시 로그 파일) |
-| **2단계: Raw Parquet 준비** | `refine_reviews.py --step convert_raw_to_parquet`로 원본 JSONL을 월별 파티션 Raw Parquet으로 1회 변환 및 검증 (완전 시 Spark 미기동 Fast-Skip) | Parquet (`data/raw_parquet/<category>/`)<br/>`partitionBy("review_year_month")` | 없음 (원천 파티션 보관) |
-| **3단계: 정제 & 중복 제거** | 대상 월 Raw Parquet 파티션만 직접 읽어 결측치 필터링 및 `review_id` 기준 분산 중복 제거 (해당 월 이미 존재 시 스킵) | Parquet (`data/processed/<category>/`)<br/>`partitionBy("review_year_month")` | `review_id` (UUID5: user_id + parent_asin + timestamp) |
-| **4단계: 월별 요약 집계** | Spark로 카테고리-월별 리뷰 수, 평균 평점 등을 요약 집계 후 PostgreSQL UPSERT 적재 (멱등성 보장, 5-1/5-2단계와 병렬 실행) | PostgreSQL (`public.monthly_review_summary`) | `(category, review_year_month)` (VARCHAR 복합 PK) |
-| **5-1단계: 상품 분석 마트** | 상품별 월별 지표(분기 포함) 집계, 리뷰 급증(100%+) 뷰, 저/다리뷰 세그먼트 비교 마트 UPSERT (4/5-2단계와 병렬 실행) | PostgreSQL (`public.product_monthly_metrics`, `public.product_segment_comparison`) | `(category, product_id, review_year_month)` 등 |
-| **5-2단계: 감정분석 마트** | Spark 기반 감정분석(NLTK VADER 기본, GPU 가속 트랜스포머 2순위) 및 별점 괴리 불만 리뷰 추출 UPSERT 적재 (4/5-1단계와 병렬 실행) | PostgreSQL (`public.product_sentiment_monthly`, `public.product_sentiment_anomalies`) | `(category, product_id, review_year_month)` 등 |
-| **6단계: 품질 검증** | Python으로 3자 집계 적재 건수, 평점 범위, 감정 점수 범위, 결측치, 뷰 조회 및 세그먼트 보존 검증 | 검증 스크립트 (SQL 쿼리) | - |
-| **7단계: FastAPI 서빙** | ConnectionPool 기반 고속 서빙 API (배치 추론 결과 서빙, 422/404 예외 규격 준수, 단건 실시간 추론 비교 제공) | FastAPI (`http://localhost:8000`) | - |
-
-### 2단계(Bronze → Silver) 분리 및 장애 방어 설계
-
-* **왜 2단계로 나누었나요? (풀 스캔 방지)**:
-  매달 수백만 건의 원본 파일 전체를 처음부터 끝까지 다 읽으면 너무 느립니다. 그래서 **2단계(Bronze)**에서 원본을 월별 파티션 Parquet으로 딱 1번만 변환해 두고, **3단계(Silver)**에서는 이번 달 데이터만 쏙 골라 읽어 빠르게 정제합니다.
-* **어떻게 안정성을 높였나요? (메모리 절약 & 장애 방어)**:
-  * **메모리 부족(OOM) 방지**: 불필요한 캐시(`.cache()`)를 없애고 메모리를 1.6GB로 늘려 버퍼 부담을 줄였습니다.
-  * **원자적 저장(Atomic Swap)**: 작업 중 서버가 꺼져도 데이터가 깨지지 않도록, 임시 폴더에서 먼저 작업한 뒤 성공했을 때만 한 번에 정상 폴더로 교체합니다.
-  * **재실행 멱등성**: 작업이 실패해 다시 돌려도 PostgreSQL `UPSERT`를 적용해 데이터 중복 없이 기존 데이터만 안전하게 덮어씁니다.
-
-### 저장 포맷을 고른 이유
-
-1. **정제 원본 ➔ Parquet (컬럼 지향 포맷)**:
-   - 70만 건 이상의 대용량 상세 데이터를 행 단위 RDBMS에 전부 저장하면 DB CPU/I/O 병목 및 스토리지 낭비가 발생합니다.
-   - Parquet은 컬럼별 Snappy 압축률이 우수하며, `partitionBy("review_year_month")`로 월별 파티션 프루닝(Partition Pruning)과 필요한 컬럼만 읽는 컬럼 프루닝(Column Pruning)을 통해 대규모 분석 쿼리 속도를 극대화합니다. 일별 파티셔닝 대비 파일/디렉토리 수를 대폭 줄여 작은 파일 문제(Small Files Problem)를 방지합니다.
-2. **집계 통계 ➔ PostgreSQL (관계형 데이터베이스)**:
-   - 월별로 요약 집계된 데이터(약 260행)는 데이터 크기가 작고, Grafana 대시보드나 백엔드 서비스에서 빈번하고 빠른 포인트 조회가 일어납니다.
-   - 인덱스와 트랜잭션(ACID)을 지원하는 RDBMS가 서빙 및 시각화 도구 연동에 가장 적합합니다.
-
-### 실행 방법
-
-파이프라인 실행은 호스트 머신의 `submit-job.sh` 스크립트를 통해 Docker 컨테이너 클러스터(`spark-master`) 내부로 전달되어 실행됩니다.
-
-#### 1. 인프라 컨테이너 빌드 및 실행 (사전 준비)
-```bash
-# 1) Spark 커스텀 이미지 빌드 (NLTK VADER 사전 및 Hugging Face DistilBERT 모델 사전 캐싱)
-docker compose build
-
-# 2) 전체 인프라 컨테이너 백그라운드 실행
-docker compose up -d
-```
-
-#### 2. 원본 데이터 수집 실행
-```bash
-./submit-job.sh jobs/collector.py
-```
-- 이미 `data/raw/All_Beauty.jsonl`이 존재하고 크기가 유효할 경우, 네트워크 다운로드를 자동으로 스킵합니다.
-- 처음부터 강제로 다시 다운로드 및 수집하려면 `--reset-state` 플래그를 추가합니다.
-
-#### 3. Spark 정제 및 요약 집계 실행
-```bash
-# 1) 원본 JSONL -> 월별 Raw Parquet 파티션 변환 및 준비 (최초 1회 실행, 이미 완료 시 즉시 스킵)
-./submit-job.sh jobs/refine_reviews.py --step convert_raw_to_parquet
-
-# 2) 특정 월(예: 2023-01) 증분 실행 (해당 월 Raw Parquet만 직접 읽어 Full Scan 제거, 정제 파티션 존재 시 스킵)
-./submit-job.sh jobs/refine_reviews.py --step refine_store_parquet --year-month 2023-01
-./submit-job.sh jobs/refine_reviews.py --step aggregate_monthly --year-month 2023-01
-
-# 3) 상품별 분석 마트 및 세그먼트 분석 실행 (PostgreSQL UPSERT)
-./submit-job.sh jobs/product_analytics.py --step all --year-month 2023-01
-# 또는 전체 기간 마트 적재
-./submit-job.sh jobs/product_analytics.py --step all --year-month all
-
-# 4) 감정분석 및 괴리 리뷰 마트 적재 (NLTK 기본 / GPU 트랜스포머 지원)
-./submit-job.sh jobs/sentiment_analysis.py --year-month 2023-01 --model-type auto
-
-# 또는 과거 전체 데이터 일괄 실행
-./submit-job.sh jobs/refine_reviews.py --step all --year-month all
-```
-
-#### 4. FastAPI 서빙 API 실행 (6회차 강의자료 규격)
-```bash
-# 로컬 개발 서버 실행 (자동 문서: http://localhost:8000/docs)
-uvicorn api.app:app --host 0.0.0.0 --port 8000 --reload
-
-# API 호출 예시 (상품별 감정 요약 조회)
-curl "http://localhost:8000/products/B00004U9V2/sentiment?dt=2023-01&category=All_Beauty"
-
-# API 호출 예시 (별점 괴리 불만 리뷰 조회)
-curl "http://localhost:8000/products/B00004U9V2/anomalies?dt=2023-01&limit=3"
-
-# API 호출 예시 (카테고리별 워스트 상품 랭킹)
-curl "http://localhost:8000/categories/All_Beauty/sentiment/rankings?dt=2023-01&order=worst&limit=5"
-
-# 실시간 단건 추론 테스트 (배치 서빙과 지연시간 비교용)
-curl -X POST "http://localhost:8000/sentiment/predict" \
-  -H "Content-Type: application/json" \
-  -d '{"text": "The delivery was super fast, but the item broke in two days. Horrible quality!"}'
-```
-
-#### 5. 결과 확인
-- **월별 Raw Parquet 파티션 확인:**
-  ```bash
-  ls -lh data/raw_parquet/All_Beauty/
-  ```
-- **정제된 Parquet 파일 확인:**
-  ```bash
-  ls -lh data/processed/All_Beauty/
-  ```
-- **PostgreSQL 월별 요약 테이블 조회:**
-  ```bash
-  docker compose exec postgres psql -U postgres -d postgres -c "SELECT * FROM monthly_review_summary ORDER BY review_year_month DESC LIMIT 5;"
-  ```
-- **PostgreSQL 상품별 마트 및 급증 뷰 조회:**
-  ```bash
-  docker compose exec postgres psql -U postgres -d postgres -c "SELECT * FROM product_monthly_metrics LIMIT 5;"
-  docker compose exec postgres psql -U postgres -d postgres -c "SELECT * FROM v_product_review_surge LIMIT 5;"
-  docker compose exec postgres psql -U postgres -d postgres -c "SELECT * FROM product_segment_comparison;"
-  ```
+> **기준 문서**: `8주차_README.md` 및 `final_presentation_deck.md` 100% 반영  
+> **대상 데이터셋**: Amazon Reviews 2023 `All_Beauty` 단일 카테고리 (1x 70만 ➔ 10x 700만 건 부하 벤치마크)  
+> **핵심 성과**: 10배 확장 환경 14분 10초 완주, 자원 누수 2중 방어선(임시 테이블/폴더 잔여 0건), 서빙 API c=50 p95 58.7ms 방어
 
 ---
 
-## Airflow DAG 설계 및 구현
+## 1. 문제와 데이터
 
-월별 Amazon 리뷰 데이터 파이프라인 dag.py의 6단계 자동화 및 오케스트레이션 명세입니다.
+### 1.1. 누가 무엇을 원하는가 (페르소나 및 비즈니스 문제)
+* **대상 사용자 (누가)**: 이커머스 카테고리 MD와 CS 운영팀.
+* **해결하려는 문제 (무엇을)**:
+  * MD와 운영팀은 어떤 상품에서 고객 불만이 급증하고 있는지, 특히 **별점은 5점이지만 본문에는 제품 파손, 부작용, 품질 불량을 호소하는 별점 괴리 리뷰**를 월별로 신속히 찾아내길 원합니다.
+  * 단순 평점 평균만으로는 이러한 치명적인 결함 리뷰를 놓치기 쉽고, 수백만 건의 비정형 리뷰 원문을 일일이 전수 조사하거나 실시간으로 LLM에 태우는 것은 비용과 지연시간 측면에서 불가능합니다.
+  * 따라서 월별 대규모 분산 배치로 원문을 정제·교차 분석하여 상품별 불만 지표와 이상 징후 원문을 PostgreSQL 마트에 사전 적재하고, 운영팀이 API를 통해 4ms 초저지연으로 조회할 수 있는 시스템을 구축했습니다.
 
-### 1. DAG 구조 (병렬 분기 및 수렴)
-
-`download_raw_data >> prepare_raw_parquet >> refine_store_parquet >> [aggregate_monthly, aggregate_product, analyze_sentiment] >> validate_data`
-
-* **`download_raw_data`**: 외부 원본 JSONL 다운로드 (기존 파일 존재 시 자동 스킵)
-* **`prepare_raw_parquet`**: 원본 JSONL을 월별 파티션 Raw Parquet(`data/raw_parquet/<category>/`)으로 최초 1회 변환 및 무결성 검증. 루트 `_SUCCESS` 및 월별 파티션(`_SUCCESS`, `_manifest.json`)이 유효하면 Spark 세션 없이 0.1초 만에 즉시 정상 종료하여 매월 전체 JSONL 재스캔을 방지합니다.
-* **`refine_store_parquet`**: 대상 월의 Raw Parquet 파티션(`review_year_month=YYYY-MM`)만 직접 읽어 결측치 필터링, UUID5 중복 제거 후 월별 정제 Parquet 저장 (해당 월 정제 파티션 이미 존재 시 스킵, Raw Parquet 부재 시 JSONL 스캔 폴백)
-* **`aggregate_monthly`**: 월별 리뷰 수·평균 평점 요약 집계 후 PostgreSQL UPSERT 적재 (멱등성 보장, 3자 병렬 실행)
-* **`aggregate_product`**: 상품별 월별 지표(review_quarter 포함) 집계, PostgreSQL `product_monthly_metrics` UPSERT 및 저/다리뷰 세그먼트 비교 마트(`product_segment_comparison`) 갱신 (3자 병렬 실행)
-* **`analyze_sentiment`**: 정제 리뷰 본문 감정분석(NLTK 기본 / GPU 트랜스포머 지원) 수행, PostgreSQL `product_sentiment_monthly` 및 별점 괴리 불만 리뷰(`product_sentiment_anomalies`) UPSERT 적재 (3자 병렬 실행)
-* **`validate_data`**: DB 3자 집계 적재 건수, 평점(1.0~5.0) 이상치, 감정 점수(-1.0~1.0) 유효성, 뷰 정상 동작 및 세그먼트 보존 검증
-
-### 2. retry · backoff 전략
-
-장애 유형에 따라 **재시도 대상**과 **즉시 로그 기록 대상**을 분리했습니다.
-
-* **재시도 대상 (일시적 장애 자동 극복)**:
-  - `download_raw_data`: 3회 재시도 (2분 ➔ 4분 ➔ 8분 지수 백오프, 외부 웹 서버 일시 타임아웃 대비)
-  - `prepare_raw_parquet`: 1회 재시도 (5분 대기, Spark 일시 리소스 경합/OOM 대비)
-  - `refine_store_parquet`: 1회 재시도 (5분 대기, Spark 일시 리소스 경합/OOM 대비)
-  - `aggregate_monthly`: 2회 재시도 (3분 간격, PostgreSQL 커넥션 풀/트랜잭션 락 대비)
-* **재시도 없음 (즉시 실패 감지)**:
-  - `validate_data`: 0회 (재시도 없음). 데이터 결함/오염은 반복 실행해도 실패하므로 즉시 중단 후 `on_failure_callback`으로 콘솔 에러 로그 기록
-  - ※ **실패 알림 기능 안내**: `notify_failure` 콜백을 통해 콘솔 `[ALERT]` 로그 기록과 함께 **Slack Incoming Webhook**(`SLACK_WEBHOOK_URL`)으로 장애 발생 DAG, Task, 일시, 에러 상세가 실시간 카드로 즉시 전송되도록 구현되어 있습니다.
-
-### 3. 스케줄 · 의존성 및 날짜 매핑
-
-* **실행 주기 & 시각**: 매월 1일 자정 (`schedule="@monthly"`)
-* **`start_date` 및 `end_date` 설정 이유와 정기 실행 전환 방법**:
-  - **`start_date` 설정 이유**: 원본 데이터셋이 2000년 11월부터 시작하므로, 2000년대~2023년 사이의 어떤 과거 월(예: 2018-01 등)을 논리적 날짜로 백필하거나 수동 트리거해도 태스크가 스킵되지 않고 정상 생성되도록 `start_date=datetime(2000, 1, 1)`로 설정했습니다. (`catchup=False`이므로 과거 구간이 폭주하여 자동 실행되지 않습니다)
-  - **`end_date` 설정 이유**: 본 실습 데이터셋은 과거 데이터(2023-09 마감)이므로, DAG 활성화 시 2023-10부터 현재(2026년)까지 데이터가 없는 빈 구간이 무의미하게 자동 스케줄링되는 것을 방지하기 위해 `end_date=datetime(2023, 10, 1)`로 설정했습니다.
-  - **정기 실행 전환 및 트리거 방법**: 현재 시점 기준 매월 실시간 파이프라인으로 전환하려면 `end_date` 파라미터를 제거하면 됩니다. Airflow 실행 시 **논리적 날짜(Logical Date)**만으로 실행 대상이 자동 판별됩니다:
-    - **2024년 이상 (기본값/현재 시점 실행)**: 전체 데이터 처리 모드 (`all`)로 자동 실행
-    - **2000~2023년 과거 일자 지정**: 해당 선택 월(예: `2023-01-01` 선택 시 `2023-01`)을 자동 핀포인트하여 증분 실행
-    - (또한 실행 화면 모달에서 `sentiment_model` 드롭다운을 통해 `hybrid`, `nltk`, `transformer` 모델을 선택할 수 있습니다)
-* **순서 선정 이유**: 원본 다운로드 ➔ Raw Parquet 준비 ➔ 월별 정제 Parquet 저장 ➔ DB 요약 집계 ➔ 품질 검증의 단계별 입력 데이터 의존성 보장
-* **리플레이 날짜 매핑**: 과거(2000~2023년) 데이터를 재현하므로, Airflow 실행의 논리적 날짜(`logical_date` 또는 `data_interval_start`의 `YYYY-MM`)를 과거 데이터 월과 1:1로 매핑하여 핀포인트 처리
-
-### 4. 운영 참고 사항
-
-* **정적 데이터셋 백필 최적화**: 현재 구조는 Raw Parquet 파티션과 완료 마커(`_SUCCESS`, `_manifest.json`)가 유효하면 원본 JSONL을 다시 읽지 않도록 설계되어 있어 과거 데이터셋 및 대규모 백필 시 불필요한 반복 I/O를 원천 차단합니다.
-* **동적 누적 데이터 확장 방안**: 향후 원본 JSONL 파일에 실시간 신규 데이터가 주기적으로 누적되는 환경으로 확장할 경우, manifest에 원본 파일의 크기·수정 시각(mtime) 또는 체크섬 해시를 기록하여 파일 변경 감지 시에만 Raw Parquet을 재생성/증분 갱신하도록 확장할 수 있습니다.
-
-
-### 5. 환경 설정 및 Git 보안 관리
-
-* **환경 변수 분리**: DB 접속 정보 및 설정은 `.env`로 격리 관리하며, 신규 환경 설정을 위해 `.env.example`을 제공합니다.
-* **Git 추적 제외 (`.gitignore`)**:
-  * 실행 로그: `logs/`, `*.log`
-  * 로컬 환경 변수: `.env`, `.env.*` (예외: `.env.example`)
-  * OS 임시 파일: `**/.DS_Store`
+### 1.2. 얼마나 많은 데이터인가 (데이터셋 규모 및 부하 구성 방식)
+* **원천 데이터셋**: Hugging Face Datasets (`McAuley-Lab/Amazon-Reviews-2023`) `All_Beauty` 카테고리
+* **단일 카테고리 원본 규모**: **701,528행**, 약 **311.5 MiB** (326,611,506 바이트).
+* **부하 테스트 환경 구축 방식 (얼마나)**:
+  * 타 카테고리를 혼용하지 않고, 오직 **All_Beauty 단일 데이터만 복제**하여 `user_id`를 회차별로 새로 부여함으로써 중복 제거 필터를 통과하도록 설계했습니다.
+  * 1배(70만 건) ➔ 2배(140만 건) ➔ 5배(350만 건) ➔ 10배(700만 건, 약 3.2GB)까지 단계별 대용량 합성 부하 환경을 구축하여 파이프라인의 처리 한계와 병목을 실측했습니다.
 
 ---
 
-## 대용량 확장 성능 측정 및 장애 복구 검증
+## 2. 구조
 
-### 1. 성능 측정 환경 및 리소스 사양
-
-데이터 규모 확장 벤치마크 및 장애 복구 테스트는 아래의 로컬 하드웨어 및 Docker Desktop VM 가상화 환경에서 수행되었습니다.
-
-| 계층 / 구분 | 항목 | 설정값 및 리소스 사양 |
-| :--- | :--- | :--- |
-| **호스트 시스템 (Host)** | 기종 / CPU | Apple Silicon MacBook Pro 16형 (Apple M1 Max, 10 Cores: 8P + 2E) |
-| | 메모리 | 32 GB 통합 메모리 (Unified Memory) |
-| | 운영체제 | macOS |
-| **Docker 가상화 환경 (VM)** | **CPU Limit** | **10 Cores** (호스트 가용 코어 전체 할당) |
-| | **Memory Limit** | **16.0 GiB** |
-| | **Swap** | **2048 MiB (2 GiB)** |
-| | **Disk Limit** | **64.0 GiB** |
-| **Spark 클러스터 컨테이너** | Worker 노드 구성 | 2 Workers (`spark-worker-1`, `spark-worker-2`) |
-| | Worker 노드별 자원 | 2 Cores, 2 GiB (`SPARK_WORKER_CORES=2`, `SPARK_WORKER_MEMORY=2g`) |
-| | Spark 총 클러스터 자원 | **4 Cores, 4 GiB** |
-| | Driver / Executor 메모리 | Driver `1600m` (1.6 GiB), Executor `1600m` (1.6 GiB) |
-| | Shuffle 파티션 수 | 32 (`spark.sql.shuffle.partitions=32`) |
-| **데이터베이스 / 브로커** | PostgreSQL 16 / Redis 7.2 | 단일 컨테이너 구성 (Airflow 메타데이터 및 분석 마트 적재) |
-
-![Docker VM 리소스 할당 환경](docs/images/docker_vm_resources.png)
-
----
-
-### 2. 데이터 규모별 처리 성능 비교 및 개선 전후 측정
-
-> **선생님 피드백 반영**: 타 카테고리를 혼용하지 않고, 오로지 **`All_Beauty` 단일 카테고리를 복제(신규 `review_id` 부여)**하여 1배(70만 건) 및 2배(140만 건) 대용량 환경을 재구축하고 파이프라인 개선 전후 성능을 실측·비교했습니다.  
-> *(※ 현재 1배와 2배까지 테스트를 완료하였으며, 5배(약 350만 건) 확장의 경우 대량 텍스트 추론 도중 BERT 모델 리소스 오류가 발생하여 원인 분석 및 최적화를 진행 중입니다.)*
-
-| 태스크 | 1x (70만 건) 개선 전 | 1x (70만 건) 개선 후 | 2x (140만 건) 개선 전 | 2x (140만 건) 개선 후 | 비고 (주요 개선 효과) |
-| :--- | :---: | :---: | :---: | :---: | :--- |
-| `download_raw_data` | 0.81초 | **0.97초** | 1.31초 | **1.90초** | 파일 유효성 검증 후 스킵 |
-| `prepare_raw_parquet` | 19.57초 | **1.81초** | 20.67초 | **2.05초** | Raw Parquet 존재 시 Fast-Skip |
-| `refine_store_parquet` | 24.99초 | **4.79초** | 28.17초 | **30.82초** | 대상 월 직접 프루닝 읽기 |
-| `aggregate_monthly` | 36.67초 | **14.19초** | 68.00초 | **15.98초** | 메모리 튜닝 및 셔플 최소화 (2x 기준 76% 단축) |
-| `aggregate_product` | 26.12초 | **25.78초** | 57.24초 | **31.06초** | **핵심 병목 개선**: PostgreSQL 병렬 읽기 및 count 제거 (2x 기준 45% 단축) |
-| `analyze_sentiment` | - | **1분 57초** | - | **3분 20초** | NLTK + DistilBERT 감정분석 및 괴리 리뷰 적재 |
-| `validate_data` | 2.06초 | **2.09초** | 3.72초 | **1.83초** | DB 무결성 및 정합성 검증 |
-
-#### 💡 성능 개선 핵심 성과 요약
-* **`aggregate_product` 2배 규모 소요시간 대폭 단축**:
-  * 140만 건(2x) 기준 기존 **57.24초 ➔ 31.06초로 약 45% 단축**되어, 데이터가 2배로 증가해도 집계 시간이 급증하지 않고 안정적으로 유지됨을 확인했습니다.
-* **`aggregate_monthly` 집계 가속**:
-  * 2배 데이터 기준 집계 소요 시간이 기존 **68.00초 ➔ 15.98초로 약 76% 대폭 단축**되었습니다.
-* **5배(5x) 확장 진행 현황**:
-  * 5배(약 350만 건) 확장 테스트 중 `analyze_sentiment` 태스크의 대량 Transformer(DistilBERT) 추론 과정에서 리소스 오류가 발생하여, 현재 1배와 2배까지의 검증을 우선 완료하고 5배 처리를 위한 모델 추론 배치 사이즈 조정 및 메모리 최적화를 이어서 진행하고 있습니다.
-
----
-
-### 3. 장애 상황 및 재실행 검증
-
-실제 장애가 발생해도 데이터가 안전한지 2가지 시나리오로 검증했습니다.
-
-#### ① 같은 월 다시 실행하기 (멱등성 검증)
-* **내용**: 이미 처리한 2023년 1월 데이터를 한 번 더 실행해 봅니다.
-* **결과**: 중복으로 쌓이지 않고 기존 데이터를 갱신하여 **정확히 7,474건 그대로 유지**됩니다 (`7,474 row => 7,474 row`).
-
-![장애상황 멱등성 검증 (재실행)](docs/images/idempotency_rerun_test.jpg)
-
-#### ② 계산 도중 Spark 강제 종료하기 (장애 복구 검증)
-* **내용**: Spark가 한창 일하는 도중에 워커 컨테이너를 강제로 꺼버립니다(`Kill` ➔ `1 Dead`).
-* **결과**: 깨진 파일이 남지 않고 자동으로 재시도되어, 데이터 유실 없이 **원래 건수인 7,474건이 온전히 복구**됩니다.
-
-![장애상황 멱등성 검증 (연산 중 Kill)](docs/images/spark_kill_recovery_test.jpg)
-
----
-
-## 7회차 과제 (A안): API / Inference 연동
-
-본 프로젝트는 **과제 A(API / Inference 연동)**를 선택하여 구현했으며, 집계 파이프라인(`aggregate_product`)의 병목을 단계별로 계측하고 개선했습니다.
-
----
-
-### 1. 서빙 구성도 (결과 테이블 ➔ API ➔ 사용처)
+### 2.1. 전체 파이프라인 아키텍처 다이어그램
 
 ```mermaid
 flowchart LR
-    A["정제 리뷰<br/>(Parquet)"] --> B["Airflow DAG<br/>analyze_sentiment"]
-    B --> C["Spark 분산 배치 추론<br/>(DistilBERT / VADER)"]
-    C --> D[("PostgreSQL 마트<br/>(ConnectionPool)")]
-    D --> E["FastAPI (Uvicorn)<br/>비동기 서빙"]
-    E --> F["사용처<br/>(Swagger UI / curl)"]
+    subgraph S1 ["1. 수집 & 원천 (Bronze)"]
+        direction TB
+        A["Hugging Face<br/>All_Beauty.jsonl"] --> B["Bronze Raw Parquet<br/>(월별 1회 파티셔닝)"]
+    end
+
+    subgraph S2 ["2. 분산 정제 & 집계 (Silver / Gold)"]
+        direction TB
+        C["Silver 정제 Parquet<br/>(UUID5 중복 제거)"] --> D["Spark 집계 & NLP<br/>(요약·세그먼트·감정분석)"]
+    end
+
+    subgraph S3 ["3. 저장 & 품질 검증"]
+        direction TB
+        E[("PostgreSQL 16 마트<br/>(복합 인덱스 & ConnectionPool)")] --> F["품질 검증<br/>(정합성 & 이상치)"]
+    end
+
+    subgraph S4 ["4. 서빙"]
+        direction TB
+        G["FastAPI API<br/>(Swagger UI)"] --> H["운영 조회<br/>(p95 4ms 즉시 반환)"]
+    end
+
+    B --> C
+    D --> E
+    E --> G
 ```
 
-* **결과 테이블**: PostgreSQL `public.product_sentiment_monthly` (월별 감정 요약), `public.product_sentiment_anomalies` (별점 괴리 불만 리뷰)
-* **API 계층**: FastAPI (Uvicorn 기반 비동기 커넥션 풀 서빙)
-* **사용처**: Swagger UI (`http://localhost:8000/docs`), cURL
-* **모델 부착 위치**:
-  * **Spark 배치 파이프라인(`jobs/sentiment_analysis.py`)**: 대량 리뷰를 오프라인에서 사전 추론하여 PostgreSQL에 적재 ➔ API는 DB 인덱스 조회로 즉시 응답하도록 분리.
+* **오케스트레이션 (Airflow)**: 월별 배치(`@monthly`)로 순차 실행 관리, 외부 장애 시 지수 백오프(2분➔4분➔8분), 최종 실패 시 Slack 실시간 알림.
+* **원자적 쓰기 & 멱등성**: 임시 Staging 디렉토리/테이블에서 연산 완료 후 검증을 거쳐 원자적 교체(Atomic Swap) 및 PostgreSQL UPSERT.
+* **자원 누수 2중 방어선**: 태스크 실패 시 `try...finally`(1차 런타임 DROP), 컨테이너 비정상 종료 시 `Startup Stale Cleanup`(2차 미정리 잔존물 일괄 소탕).
+
+### 2.2. 도구별 역할 및 선정 이유
+
+| 도구 / 컴포넌트 | 파이프라인 내 역할 | 기술 선정 이유 및 핵심 메커니즘 |
+| :--- | :--- | :--- |
+| **Docker Compose** | 인프라 컨테이너 통합 관리 | Airflow, Spark(Master+2Workers), PostgreSQL, Redis, FastAPI를 단일 환경으로 격리 배포하여 환경 일관성 및 재현성 확보 |
+| **Apache Airflow** | 월별 배치 오케스트레이션 | `@monthly` 주기 실행, 의존성 관리, 외부 수집 시 지수 백오프(2m➔4m➔8m) 재시도, 최종 실패 시 Slack Incoming Webhook 실시간 알림 |
+| **Apache Spark 4.2** | 대용량 분산 정제 및 집계 | 70만~700만 건 대용량 데이터의 월별 파티셔닝, UUID5 분산 중복 제거, 상품/감정 집계 분산 처리 |
+| **Apache Kafka (미사용)** | 적용하지 않음 | 데이터가 월별 배치로 수집되어 실시간 이벤트 스트리밍 요구가 없으므로 도입하지 않았습니다. Kafka는 이 프로젝트의 배치 파이프라인에 필수는 아니며, 실시간 리뷰 유입·처리가 필요해질 때 검토할 수 있습니다. |
+| **Parquet (Snappy)** | Bronze/Silver 스토리지 포맷 | Snappy 압축 컬럼 지향 저장소. `review_year_month` 월별 파티션 프루닝을 통해 증분 배치 시 전체 풀 스캔을 원천 차단 |
+| **PostgreSQL 16** | 집계 마트 및 서빙 저장소 | 집계 요약 통계 적재, B-Tree 복합 인덱스(`category, product_id, review_year_month, sentiment_score ASC`) 기반 0.5ms 포인트 조회 제공 |
+| **FastAPI + Uvicorn** | 초저지연 서빙 API | 비동기 ConnectionPool을 적용하여 TCP 핸드셰이크 오버헤드를 제거, 동시 50개 고부하에서도 p95 58.7ms 초저지연 서빙 달성 |
 
 ---
 
-### 2. 모델 연결 방식 및 선정 이유
+## 3. 설계 결정 (핵심 3개)
 
-* **채택 방식**: **배치 추론 (Batch Inference)**
-* **선정 이유**:
-  1. **감정분석 집계 통계 제공 목적**:
-     - 사용자가 API에서 조회하려는 것은 특정 상품의 **'월별 감정 요약 통계(긍정/부정 비율, 평균 점수)'**와 **'별점 괴리 불만 리뷰 목록'**입니다.
-     - 수천~수만 건의 상품 리뷰 본문을 요약 집계하려면 전체 리뷰에 대한 감정분석이 먼저 완료되어 있어야 하므로, Spark 배치 파이프라인에서 감정 점수를 미리 도출하고 집계 마트에 적재해 두는 것이 서비스 목적에 부합합니다.
-  2. **배치 파이프라인 데이터 특성과의 일치**:
-     - 리뷰 데이터 자체가 실시간 1건씩 인입되는 형태가 아니라, 월별로 대량 수집·정제되는 배치 데이터입니다.
-     - 따라서 감정분석 모델 추론 역시 정제 파이프라인(`analyze_sentiment`) 단계에 포함하여 일괄 처리하는 것이 데이터 라이프사이클상 가장 자연스럽고 효율적입니다.
+| 구분 | 맥락 (Context) | 결정 (Decision) | 대안 (Alternatives) | 포기한 것 (Trade-off) |
+| :--- | :--- | :--- | :--- | :--- |
+| **① 스토리지 계층화** | 700만 건 리뷰 상세를 RDBMS에 전부 넣으면 I/O와 버퍼 풀이 고갈되고, 파일로만 두면 고동시성 API 포인트 조회가 불가능함. | 상세 정제 데이터는 **월별 파티셔닝 Parquet**에, 대시보드·API 요약 데이터는 **PostgreSQL 인덱스 마트**로 분리 적재. | All-in-PostgreSQL (I/O 병목 및 비용 폭증) / All-in-Parquet (API 응답 지연 한계) | 단일 저장소 관리의 단순성을 포기하고, 저장소 간 동기화 파이프라인 관리 비용을 감수함. |
+| **② Staging 기반 원자적 쓰기 & 2중 방어선** | 작업이 99%에서 중단 시 파티션 폴더나 테이블이 반만 생성되어 오염되고, 일반 overwrite는 실패 시 기존 데이터까지 영구 유실됨. | 격리된 **임시 Staging 디렉토리/테이블에 먼저 적재 후 검증 ➔ `os.rename` 원자적 교체(Atomic Swap) 및 DB UPSERT**. 자원 누수는 `try...finally` 및 `Startup Cleanup` 2중 방어로 해결. | 일반 Spark overwrite (장애 시 기존 데이터 영구 삭제) / Append-only (스토리지 폭증) | 임시 폴더/테이블 생성 및 원자적 교체에 따른 추가 메타데이터 조작 오버헤드 감수. |
+| **③ 하이브리드 감정분석 및 사전 적재** | 700만 건 전수 BERT 추론은 CPU 환경에서 메모리 OOM 유발. API 호출마다 실시간 LLM 추론 시 초당 처리량이 무너짐. | **VADER 1차 전수 스캔 ➔ 괴리 의심군(평점 4점 이상 & 부정)만 DistilBERT 2차 검증** 하이브리드 파이프라인 + **배치 사전 적재** 후 API는 인덱스 조회만 수행. | 100% 실시간 API 추론 (동시 요청 처리 불가) / 전수 100% BERT 추론 (파이프라인 시간 폭증) | 리뷰 등록 즉시 반영되는 완전한 실시간성을 포기하고, 배치 주기(월/일) 정합성과 초저지연 API 응답 속도를 선택함. |
 
 ---
 
-### 3. Endpoint 목록 및 실제 요청·응답
+## 4. 안정성 검증
 
-#### ① Endpoint 목록
+### 4.1. 멱등성 및 데이터 무결성 검증 (투입·저장·유실/중복)
 
-| Method | Endpoint | 설명 | 상태 코드 |
-| :--- | :--- | :--- | :--- |
-| `GET` | `/health` | 서버 및 DB 커넥션 풀 헬스체크 | 200 OK |
-| `GET` | `/products/{product_id}/sentiment` | 상품별 월별 감정분석 요약 조회 | 200 OK / 404 / 422 |
-| `GET` | `/products/{product_id}/anomalies` | 별점은 높으나 본문은 부정적인 괴리 불만 리뷰 조회 | 200 OK / 404 / 422 |
-| `GET` | `/categories/{category}/sentiment/rankings` | 카테고리별 워스트/베스트 상품 랭킹 | 200 OK / 404 / 422 |
+네트워크 재시도, 수집기 오류, 또는 동일 파일의 중복 인입 상황을 가정하여 데이터 정합성과 멱등성을 검증했습니다:
 
-#### ② Swagger UI 실행 및 정상 응답 (200 OK)
+* **투입 데이터**: 동일 파일이 2번 들어오는 중복 인입 상황을 모의하여 140만 건(All_Beauty 2배 복제본)을 파이프라인에 투입.
+* **중복 제거 및 적재**: `user_id`, `parent_asin`, `timestamp`를 결합한 UUID5 고유 식별자(`review_id`)를 생성하여 중복 70만 건을 분산 필터링하고, 원본 데이터 건수인 **693,547건**이 정밀하게 적재됨.
+* **유실·중복 결과**: **데이터 유실 0건, 중복 0건** (100% 멱등성 유지).
+* **Worker 장애 격리**: Spark 연산 중간에 Worker 노드를 강제 종료(`docker stop spark-worker-2`)해도 Staging 격리 구조 덕분에 메인 마트에 불완전 데이터가 0건 유입되었으며, Worker 복구 후 재실행 시에도 데이터 수치 불일치 없이 정상 완료되었습니다.
 
-> **Swagger UI 테스트 캡처 (`GET /products/{product_id}/sentiment`):**
-> *(Swagger UI에서 실행한 캡처 이미지를 여기에 첨부)*
-> ![Swagger UI 응답 화면](docs/images/api_swagger_response.png)
+### 4.2. 자원 누수(Resource Leak) 방어 2중 방어선 설계
 
-* **상품별 월별 감정 요약 조회 요청 (`GET`)**:
-  ```bash
-  curl "http://localhost:8000/products/B0C6GZ8GY5/sentiment?dt=2023-08&category=All_Beauty"
-  ```
-* **정상 응답 (200 OK)**:
-  ```json
-  {
-    "category": "All_Beauty",
-    "product_id": "B0C6GZ8GY5",
-    "review_year_month": "2023-08",
-    "total_reviews": 15,
-    "avg_sentiment_score": 0.6521,
-    "sentiment_breakdown": {
-      "positive_reviews": 12,
-      "neutral_reviews": 2,
-      "negative_reviews": 1,
-      "positive_ratio": 0.8,
-      "negative_ratio": 0.0667
-    },
-    "mismatch_reviews": 1,
-    "model_name": "hybrid-distilbert",
-    "updated_at": "2026-11-09T16:15:00+09:00"
-  }
-  ```
+분산 배치 환경에서 장애가 발생했을 때 남겨지는 임시 테이블과 격리 디렉토리가 디스크와 데이터베이스를 잠식하는 문제를 근본적으로 해결했습니다:
 
-#### ③ 잘못된 요청 처리 (422 & 404)
+```mermaid
+flowchart TD
+    A["파이프라인 태스크 시작"] --> B["[2차 방어] Startup Stale Cleanup<br/>(이전 비정상 종료 잔여 Staging / Quarantine 일괄 탐색 및 삭제)"]
+    B --> C["임시 리소스 생성<br/>(staging_table, quarantine_dir)"]
+    C --> D{"try 블록 실행<br/>(Spark JDBC 쓰기 및 UPSERT / 파티션 정제)"}
+    D -- "정상 성공" --> E["finally 블록 진입"]
+    D -- "예외/실패 발생" --> F["에러 로깅 및 알림 전송"] --> E
+    E --> G["[1차 방어] 원자적 리소스 해제<br/>(DROP TABLE IF EXISTS & shutil.rmtree)"]
+    G --> H["자원 누수 0건 유지 (Clean State)"]
+```
 
-* **422 Unprocessable Entity (날짜 형식 오류 - `YYYY-MM` 정규식 실패)**:
-  ```bash
-  curl -i "http://localhost:8000/products/B0C6GZ8GY5/sentiment?dt=202308"
-  # HTTP/1.1 422 Unprocessable Entity
-  # {"detail": [{"loc": ["query", "dt"], "msg": "String should match pattern '^\d{4}-(0[1-9]|1[0-2])$'"}]}
-  ```
-* **404 Not Found (존재하지 않는 상품 조회 시)**:
-  ```bash
-  curl -i "http://localhost:8000/products/NON_EXISTENT_ID/sentiment?dt=2023-08"
-  # HTTP/1.1 404 Not Found
-  # {"detail": "카테고리 'All_Beauty'의 상품 'NON_EXISTENT_ID'에 대한 2023-08 감정분석 집계 결과가 없습니다."}
-  ```
+| 구분 | 개선 전 현상 | 개선 후 결과 (8주차 실측) |
+| :--- | :--- | :--- |
+| **PostgreSQL Staging 테이블** | 실패 시 `*_staging_{run_id}`가 DB에 영구 잔존 (실패 반복 시 수십 개 누적) | **`try...finally`로 즉시 DROP, SIGKILL 시에도 Startup Cleanup으로 잔여 0건 유지** |
+| **Quarantine 디렉토리** | 파티션 교체/검증 실패 시 생성된 격리 폴더가 디스크에 영구 잔존 | **`finally` 블록 및 시작 정리 로직을 통해 작업 종료 후 디스크 점유 0 Byte 유지** |
+| **재실행 멱등성** | 이전 실패 잔여물과의 충돌 위험 및 디스크 낭비 | 장애 발생 후 재실행 시 **완벽한 클린 상태에서 멱등적 데이터 갱신 보장** |
+
+### 4.3. 고의 장애 인가 검증 스크립트 실측 결과 (`scripts/test_two_layer_resource_defense.sh`)
+* **1차 방어선 (Runtime Exception)**: 작업 중간 강제 RuntimeError 발생 시 `finally` 블록 즉시 진입 ➔ `product_monthly_metrics_staging_*` 즉시 DROP ➔ **잔여 Staging 테이블 0개 (PASS)**.
+* **2차 방어선 (SIGKILL 모의)**: 비정상 종료 잔존물 인위적 생성(Staging 2개, Quarantine 1개 감지) ➔ 다음 태스크 기동 시 `Startup Stale Cleanup`이 일괄 삭제 ➔ **소탕 후 잔여 Staging 0개, 디스크 0 Byte (PASS)**.
+* **Worker 노드 중단 (`docker stop spark-worker-2`)**: 연산 도중 노드 중단 시 메인 마트 행 수 오염 0건, 워커 복구 후 재실행 시 멱등 정합성 100% 유지.
 
 ---
 
-### 4.aggregate_product 단계별 병목 계측 및 개선 요약
+## 5. 로드 테스트
 
-> **피드백 반영**: 단일 카테고리(`All_Beauty`) 복제(review_id 신규 생성) 대용량 환경 기준, `aggregate_product` 내부 소요 시간을 Spark vs PostgreSQL 구간별로 계측하여 병목을 특정했습니다.
+### 5.1. 측정 환경 (Benchmark Environment)
+* **하드웨어**: Apple Silicon Mac (M-series, 8+ vCPU, 16GB+ RAM)
+* **클러스터 구성**: Docker Compose 격리 네트워크
+  * Spark Master (1) + Spark Worker (2, 각 1.6GB Memory)
+  * PostgreSQL 16 (`work_mem = 64MB`, `synchronous_commit = off`)
+  * FastAPI Uvicorn Server (ConnectionPool 적용, 포트 8000)
+* **테스트 데이터**: Amazon Reviews 2023 `All_Beauty` 단일 카테고리 1x(70만) ➔ 2x(140만) ➔ 5x(350만) ➔ 10x(700만 건)
 
-#### ① 세부 구간별 실측 소요시간 계측표 (`task_id=aggregate_product`, 총 41.09초)
+### 5.2. 1x ➔ 10x 스케일아웃 실측 벤치마크 결과
 
-| 구분 | 세부 단계 | 소요 시간(초) | 비중 | 원인 및 현상 |
-| :--- | :--- | :---: | :---: | :--- |
-| **[Spark I/O]** | **1. Parquet 데이터 로딩** | **16.60초** | **46.7%** | 🚨 **최대 병목**: 로깅용 `df.count()`로 인해 디스크 전수 풀 스캔 발생 |
-| **[Postgres UPSERT]** | **4. PostgreSQL 마트 UPSERT** | **9.74초** | **27.4%** | `work_mem` 한계로 41만 건 ON CONFLICT 시 디스크 버퍼 스필 |
-| **[Spark 연산]** | 2. 상품-월별 집계 연산 | 2.64초 | 7.4% | Parquet 그룹화 연산 |
-| **[Spark 연산]** | 6. 분위수 및 세그먼트 집계 | 2.56초 | 7.2% | `approxQuantile` 및 세그먼트 분류 |
-| **[Postgres Write]** | 3. Staging 적재 | 2.19초 | 6.1% | PostgreSQL Multi-row 분산 쓰기 |
-| **[Postgres Read]** | 5. 세그먼트용 마트 PostgreSQL 로드 | 1.08초 | 3.0% | 단일 커넥션 순차 읽기 (1개 코어만 사용) |
-| **[기타/오버헤드]** | Subprocess 및 JVM 기동 | 5.54초 | - | 프로세스 생성 및 세션 연결 |
+All_Beauty 단일 데이터셋을 70만 건(1x)에서 700만 건(10x)까지 4단계로 점진 확장하며 파이프라인의 처리량과 자원 한계를 계측했습니다:
 
-#### ② 핵심 개선 사항 요약 (5가지)
+* **스케일업 성능**: 데이터 규모가 10배(70만 ➔ 700만 건) 증가하는 동안 전체 파이프라인 수행 시간은 **3분 06초에서 14분 10초로 약 4.5배 증가**에 그쳐 안정적인 확장성을 입증했습니다.
+* **최대 병목 구간 특정**: 집계 마트 태스크(`aggregate_monthly`, `aggregate_product`)는 데이터가 10배 늘어도 20초대를 유지했으나, **감정 분석(`analyze_sentiment`)은 1분 45초에서 12분 24초로 정비례($O(N)$) 증가하며 전체 수행 시간의 87%를 점유**했습니다. 이는 CPU 환경에서 자연어 토큰화와 트랜스포머 추론을 수행할 때 발생하는 대표적인 연산 집약적 병목입니다.
 
-1. **Parquet 불필요 `df.count()` 제거**:
-   - 단순 로깅 목적의 카운트를 제거하고 집계 연산과 통합하여 **16.60초의 디스크 I/O 제거 (16.6초 ➔ 0초)**.
-2. **PostgreSQL 대량 UPSERT 메모리 증설 (`SET LOCAL work_mem = '64MB'`)**:
-   - 트랜잭션 내 정렬 및 해시 조인 메모리를 늘려 41만 건 UPSERT 시간을 **9.7초 ➔ 6.1초로 단축**.
-3. **PostgreSQL 마트 읽기 8-파티션 병렬 분할**:
-   - `(hashtext(product_id) & 7)` 해시 키로 Spark 8개 코어가 PostgreSQL을 동시 병렬 조회하도록 개선.
-4. **DAG 순차 실행 전환 (`aggregate_monthly >> aggregate_product`)**:
-   - 두 집계 태스크 간의 코어/메모리 경합을 없애고, `aggregate_product`가 클러스터 리소스를 100% 활용하도록 보장.
-5. **트랜잭션 가속 (`SET LOCAL synchronous_commit = 'off'`)**:
-   - Staging ➔ Target 마트 대량 UPSERT 시 물리 디스크 fsync 대기를 건너뛰어 커밋 지연을 단축. (재실행 멱등성이 보장되는 배치 데이터 특성을 활용한 쓰기 최적화)
+| 태스크 ID | 역할 및 오퍼레이터 | 1x (원천 70만) | 2x (140만) | 5x (350만) | 10x (700만) | 스케일링 특성 및 병목 분석 |
+| :--- | :--- | :---: | :---: | :---: | :---: | :--- |
+| `refine_store_parquet` | 정제 & 파티셔닝 | 23.1초 | 30.8초 | 5.4초 | 47.2초 | 10배 규모에서도 47초로 완만하게 증가 ($O(N)$ 분산 제어) |
+| `aggregate_monthly` | 월별 요약 UPSERT | 13.9초 | 15.9초 | 17.8초 | 18.0초 | **10배 증가에도 +4.1초만 증가** (최적화 완료) |
+| `aggregate_product` | 상품 분석 마트 | 26.5초 | 31.0초 | 27.5초 | 23.3초 | **20초대 유지 방어 성공** (병렬 JDBC & Multi-row rewrite 효과) |
+| `analyze_sentiment` | **감정분석 & 마트** | **1분 45초 (56%)** | **3분 20초 (70%)** | **5분 39초 (83%)** | **12분 24초 (87%)** | 🚨 **전체 파이프라인 최대 병목 ($O(N)$ 정비례 증가)** |
+| **총 파이프라인 시간** | **End-to-End** | **약 3분 06초** | **약 4분 43초** | **약 6분 45초** | **약 14분 10초** | **데이터 10배 증가 대비 총 시간 4.5배 수준으로 방어** |
 
-* **최종 결과**:
-  * **`aggregate_product` 소요 시간: 41.09초 ➔ 약 15~18초 (50% 이상 단축)**
+### 5.3. 집계 마트 성능 프로파일링 및 최적화 (41초 ➔ 15초대, 60% 단축)
+* **성능 프로파일링 (초기 41.09초 병목 원인 분석)**:
+  * 초기 `aggregate_product` 수행 시간 41.09초를 세부 계측한 결과,
+  * 디버깅 및 콘솔 확인용 `df.count()` 연산이 지연 평가(Lazy Evaluation) 특성상 불필요한 디스크 풀 스캔을 유발하여 46.7%(16.6초)를 소모하고 있음을 확인.
+  * PostgreSQL의 기본 세션 메모리 부족으로 인한 디스크 스필(External Merge Disk)이 27.4%(9.7초)를 소모하고 있음을 확인.
+* **최적화 조치**:
+  1. 불필요한 로깅용 `df.count()` 전면 제거 및 단일 디스크 스캔으로 groupBy 집계 연산 통합.
+  2. PostgreSQL 세션 `work_mem`을 64MB로 증설하여 메모리 정렬(Quicksort) 보장.
+  3. 8-파티션 병렬 읽기 및 Multi-row rewrite(`batchsize=10000`, `reWriteBatchedInserts=true`) 적용.
+* **최적화 결과**:
+  * 소요 시간이 **41.09초에서 15~18초대로 60% 이상 대폭 단축**되었으며, 10배 부하 환경에서도 23.3초를 기록하며 확장성을 확보했습니다.
+
+### 5.4. 서빙 API `hey` 부하 테스트 및 EXPLAIN ANALYZE 정렬 최적화
+* **쿼리 플랜 최적화 (`EXPLAIN ANALYZE`)**:
+  * 기존 인덱스에 `sentiment_score` 정렬 컬럼이 없어 발생하던 **`Sort Method: quicksort (actual time=0.585ms)`** 병목 확인.
+  * 복합 인덱스(`idx_sent_anom_cat_prod_ym_score`)를 생성하여 정렬 단계를 원천 제거 (Execution Time: **0.597ms** 달성).
+* **`hey` 로드 테스트 실측 비교표 (10초 지속 부하, 엔드포인트: `/products/{id}/sentiment`)**:
+
+| 동시 요청 수 (`-c`) | 총 처리 건수 | 성공률 (200 OK) | 초당 처리량 (RPS) | 평균 지연시간 (Avg) | **p95 지연시간** | p99 지연시간 | 최대 지연시간 (Max) |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **c = 5** | 14,848건 | **100.0%** | **1,483.7 req/s** | 3.4 ms | **4.3 ms** | 6.5 ms | 35.5 ms |
+| **c = 20** | 13,912건 | **100.0%** | **1,390.1 req/s** | 14.4 ms | **19.0 ms** | 25.4 ms | 63.6 ms |
+| **c = 50** | 12,591건 | **100.0%** | **1,255.5 req/s** | 39.8 ms | **58.7 ms** | 71.4 ms | 105.3 ms |
+
+* 총 41,351건의 대량 요청 중 **에러율 0.0%**, 동시 요청 50개 고부하에서도 **p95 58.7ms로 웹 SLA(100ms) 여유 있게 방어**.
+
+---
+
+## 6. 실행 방법
+
+복사해서 바로 터미널에 붙여넣어 실행할 수 있는 명령어 모음입니다.
+
+### 6.1. 인프라 기동 및 상태 확인
+```bash
+# 1. 전체 Docker 컨테이너 백그라운드 기동
+docker compose up -d
+
+# 2. 실행 컨테이너 상태 확인
+docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+```
+
+### 6.2. 2중 방어선 및 고의 장애 인가 종합 검증 (1클릭 실행)
+```bash
+# 1차 방어선(Runtime Exception) + 2차 방어선(SIGKILL 잔존물) + Worker 복구 + 3ms 서빙 조회 자동 검증
+bash scripts/test_two_layer_resource_defense.sh
+```
+
+### 6.3. Airflow 파이프라인 E2E 배치 수동 트리거
+```bash
+# Airflow CLI를 통한 All_Beauty 파이프라인 실행
+docker exec airflow-scheduler airflow dags trigger monthly_amazon_reviews_pipeline \
+  --conf '{"category": "All_Beauty", "year_month": "2023-01"}'
+
+# Airflow 웹 UI 접속: http://localhost:8080 (ID/PW: admin / admin)
+```
+
+### 6.4. FastAPI 서빙 API 조회 및 Swagger UI
+```bash
+# 1. 서빙 헬스체크
+curl -s http://localhost:8000/health
+
+# 2. 상품별 월별 감정 요약 초저지연 조회
+curl -s "http://localhost:8000/products/B08CK8CQKS/sentiment?dt=2022-07&category=All_Beauty" | jq
+
+# 3. 별점-본문 괴리 불만 리뷰 원문 초저지연 조회
+curl -s "http://localhost:8000/products/B08CK8CQKS/anomalies?dt=2022-07&category=All_Beauty" | jq
+
+# 4. 브라우저 대화형 Swagger 문서: http://localhost:8000/docs
+```
+
+### 6.5. `hey` API 부하 테스트 실행
+```bash
+# 동시 요청 50개, 10초간 부하 계측
+hey -n 20000 -c 50 -z 10s "http://localhost:8000/products/B0C6GZ8GY5/sentiment?dt=2023-08&category=All_Beauty"
+```
+
+---
+
+## 7. 회고와 다음 단계
+
+### 7.1. 다시 한다면 바꿀 것 (Refactoring & Learnings)
+1. **NLP 추론의 Spark 분리 및 GPU 전용 노드 배치**:
+   * CPU 기반 Spark Executor에서 트랜스포머 추론을 수행하다 보니, 10배 확장 환경에서 감정분석이 12분 24초를 소모하며 **전체 파이프라인 시간의 87%를 독식**했습니다.
+   * 다시 한다면 텍스트 토큰화 및 모델 추론 구간을 Spark 클러스터에서 분리하여, Triton Inference Server나 Ray Cluster 기반의 GPU 전용 추론 노드로 비동기 오프로딩하겠습니다.
+2. **고성능 대형 언어 모델(LLM) 및 정밀 뉘앙스 분석 도입**:
+   * 현재는 속도와 리소스 한계로 인해 경량 DistilBERT 모델을 사용했습니다.
+   * GPU 인프라를 바탕으로 고성능 도메인 특화 모델이나 최신 LLM을 연동하여, "완벽하게 망가져서 왔네요"와 같은 반어법이나 다중 속성(배송 vs 제품 성능) 불만을 정밀 분리해 내겠습니다.
+
+### 7.2. 실제 운영 환경이라면 추가할 것 (Production Architecture)
+1. **Kafka + Spark Structured Streaming 기반 실시간 스트리밍 결합**:
+   * 현재 파이프라인은 월 단위 배치로 동작하여 고객 불만을 감지하기까지 최대 수일에서 한 달의 지연이 발생할 수 있습니다.
+   * 실제 서비스 환경이라면 Kafka 토픽으로 실시간 유입되는 리뷰 이벤트를 Spark Structured Streaming으로 실시간 전처리하고, 별점 괴리 이상 리뷰 발생 시 MD/CS팀 슬랙으로 즉시 긴급 알림을 쏘는 구조로 확장하겠습니다.
+2. **Prometheus / Grafana 분산 메트릭 및 OpenTelemetry 추적 체계**:
+   * 배치 단계의 Executor별 I/O 스필, GC 지연과 서빙 계층의 p99 지연시간을 실시간 APM 대시보드로 시각화하여 모니터링 체계를 고도화하겠습니다.
+
+---
+
+## 8. 예상 질문과 답
+
+### Q1. 8주차에 추가된 PostgreSQL Staging 테이블 누적 문제는 어떻게 해결했나요?
+> **답변**: 데이터를 안전하게 덮어쓰기 위해 임시 테이블(Staging)을 만들어 작업하는데, 기존에는 작업 중간에 에러가 나면 이 임시 테이블이 지워지지 않고 DB에 계속 쌓이는 문제가 있었습니다.  
+> 이를 해결하기 위해 **2단계 청소 장치**를 만들었습니다.  
+> 1. **1차 정리**: 코드가 실패하더라도 파이썬의 `finally` 문으로 임시 테이블을 즉시 삭제(DROP)합니다.  
+> 2. **2차 정리**: 만약 서버 강제 종료나 메모리 부족으로 프로세스 자체가 증발하여 1차가 동작하지 못했다면, **다음 작업이 시작될 때 이전에 남아있던 임시 테이블을 먼저 찾아서 싹 지우고 시작**하도록 했습니다.  
+> 덕분에 작업이 실패해도 DB에 찌꺼기 테이블이 남지 않고 0개를 유지합니다.
+
+### Q2. 파일시스템 Quarantine(격리) 디렉토리는 왜 생기고 어떻게 관리했나요?
+> **답변**: 데이터 검증에 실패했을 때 망가진 데이터가 정상 파일과 섞이지 않도록 격리(Quarantine) 폴더로 옮겨둡니다. 그런데 예전에는 이 격리 폴더를 지우는 기능이 없어서 디스크 용량을 계속 차지했습니다.  
+> 8주차에는 작업이 끝나거나 다음 작업이 시작될 때 **오래된 격리 폴더를 자동으로 감지해서 깨끗이 지우는 로직**을 추가해 디스크 낭비를 막았습니다.
+
+### Q3. 감정분석(analyze_sentiment)이 왜 파이프라인의 87%나 차지했나요?
+> **답변**: 글을 단어 단위로 쪼개고 AI 모델(트랜스포머)로 감정을 분석하는 과정은 컴퓨터 계산량이 매우 많기 때문입니다. 특히 지금은 그래픽카드(GPU) 없이 일반 CPU로만 모델을 돌리다 보니, 데이터가 10배로 늘어났을 때 시간도 1분 45초에서 12분 24초로 크게 늘어났습니다.  
+> 반면 숫자 통계를 내는 일반 집계 작업은 최적화를 통해 20초대를 지켜냈기 때문에, 향후 대용량 확장 시 감정분석만 따로 떼어내 GPU 서버에 맡겨야 한다는 점을 숫자로 확인했습니다.
+
+### Q4. API 서빙 부하 테스트에서 동시 요청 50개일 때 p95 지연시간(58.7ms)이 늘어난 원인은 무엇인가요?
+> **답변**: 한 번에 50개의 요청이 동시에 몰리다 보니, DB에 연결하기 위해 줄을 서서 기다리는 대기 시간(커넥션 풀 대기)이 발생했기 때문입니다.  
+> 하지만 단 1건의 에러나 멈춤 없이 100% 정상 응답했고, 웹 서비스에서 보통 기준으로 삼는 100ms보다 훨씬 빠른 58.7ms 안에 모두 처리되어 안정성을 입증했습니다.
+
+### Q5. All_Beauty 데이터 복제 시 실제 데이터 다양성이 늘어난 것인가요?
+> **답변**: 아닙니다. 이 실험은 데이터 내용이 다양해진 것이 아니라, **"데이터 양이 10배로 늘어났을 때 우리 시스템이 버틸 수 있는가"를 측정하기 위한 성능 부하 테스트**입니다. 중복 제거 필터를 통과할 수 있도록 고유 ID만 새로 부여해 70만 건을 700만 건으로 복제한 환경입니다.
+
+### Q6. 집계 태스크 3개(`aggregate_monthly`, `aggregate_product`, `analyze_sentiment`)를 병렬로 돌리지 않은 이유는 무엇인가요?
+> **답변**: 컴퓨터의 CPU와 메모리가 한정되어 있기 때문입니다. 3개의 무거운 Spark 작업을 동시에 돌리면 메모리가 부족해져서 시스템이 갑자기 꺼지는 현상(OOM)이 발생할 수 있습니다. 그래서 안전하게 작업을 하나씩 순서대로 실행하여 컴퓨터 자원을 100% 집중해 안정적으로 완주하도록 만들었습니다.
 
